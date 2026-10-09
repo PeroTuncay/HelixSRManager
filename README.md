@@ -26,9 +26,18 @@ HelixSR README, and checks that it actually runs.
    in as `amd_fidelityfx_upscaler_dx12.amd.dll` and set as HelixSR's `[Forwarding] UpscalerDll`, so FSR 4 stays in
    OptiScaler's FFX Upscaler list for comparison. The previous `amd_fidelityfx_dx12.dll` is copied in as
    `amd_fidelityfx_dx12.original.dll` so frame generation keeps working.
-5. **Check**: reads `helixsr.log` (network running / not running / loaded but idle, wave size, network resolution) and,
+5. **Setup progress**: while the setup runs, a progress bar with the current step (in step 5 the compiled shaders,
+   e.g. 41/72), the elapsed time, whether it is actually working (CPU use of its processes) and what runs right now.
+   HelixSR's steps print nothing while they work, so the log alone can stay unchanged for minutes. The setup keeps
+   running when the menu is closed or Decky restarts the plugin, and its exit code is recorded either way. If it
+   fails: the error lines, **Show full log**, **Run diagnostics** (Proton, Python/numpy, free space, GitHub, …) and
+   **Save debug report** (`~/HelixSR/helixsr-manager-debug.txt`).
+6. **Clean**: removes every downloaded release, the setup's Python, shader compiler and Wine data
+   (`~/.local/share/HelixSR`) and temporary files. Games keep their installed copy. Only files recognizably
+   HelixSR's are removed from the HelixSR folder.
+7. **Check**: reads `helixsr.log` (network running / not running / loaded but idle, wave size, network resolution) and,
    if enabled, OptiScaler.log lines about HelixSR/FFX.
-6. **Settings**: `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per install.
+8. **Settings**: `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per install.
 
 ## Install on the Deck
 
@@ -46,6 +55,8 @@ npm run package     # -> out/HelixSR-Manager.zip
 ## Notes
 
 - Runs as the `deck` user (no root).
+- Don't let the Deck sleep during the setup (sleep pauses it). Expect it to take longer than the 4-5 minutes HelixSR
+  quotes for a desktop CPU.
 - If the setup fails in Gaming Mode, run `~/HelixSR/helixsr-setup.sh` once from Konsole in Desktop Mode; the plugin
   picks up the built DLL afterwards.
 - Direct3D 12 only. Vulkan games aren't supported by HelixSR.

@@ -31,6 +31,10 @@ HOME = Path(decky.DECKY_USER_HOME)
 SETTINGS_FILE = Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
 RUNTIME_DIR = Path(decky.DECKY_PLUGIN_RUNTIME_DIR)
 SETUP_LOG = Path(decky.DECKY_PLUGIN_LOG_DIR) / "helixsr-setup.log"
+SETUP_DIR = RUNTIME_DIR / "setup"
+SETUP_STATUS = SETUP_DIR / "status.json"   # tag, pid, start time: survives plugin restarts
+SETUP_RC = SETUP_DIR / "exit-code"         # written by the wrapper shell when the setup ends
+SETUP_TMP = SETUP_DIR / "tmp"              # TMPDIR for the setup, so its work folder can be watched
 
 RELEASES_API = "https://api.github.com/repos/lonewolf0622/HelixSR/releases?per_page=100"
 RELEASES_CACHE = Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "releases.json"
@@ -130,10 +134,14 @@ def clean_env():
     """Environment for child processes: Decky's bundled Python sets LD_LIBRARY_PATH to its own libraries, which breaks
     system tools such as curl and Proton's wine."""
     env = dict(os.environ)
-    if "LD_LIBRARY_PATH_ORIG" in env:
-        env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
-    else:
-        env.pop("LD_LIBRARY_PATH", None)
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    # PyInstaller's own variables (PYTHONHOME, PYTHONPATH, anything pointing into its _MEI folder) would make the
+    # setup's Python load Decky's bundled standard library instead of its own
+    for k in list(env):
+        if k in ("PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH") or k.startswith(("_MEI", "_PYI")) or "_MEI" in env[k]:
+            env.pop(k)
+    if orig:
+        env["LD_LIBRARY_PATH"] = orig
     env["HOME"] = str(HOME)
     env["USER"] = decky.DECKY_USER
     env["XDG_DATA_HOME"] = str(HOME / ".local/share")
@@ -687,29 +695,329 @@ def uninstall_optiscaler(opti_dir):
     return "OptiScaler is back to its previous upscaler"
 
 
+# --- setup tracking ---------------------------------------------------------------------------------------------------
+# HelixSR's setup prints one header line per step and keeps each step's tools quiet, so the log alone can't tell
+# "working" from "stuck". Progress comes from the step headers, the shaders compiled so far in its work folder and the
+# CPU time of its process tree (read from /proc).
+
+PHASES = [  # (log pattern, progress %, label)
+    (r"\[helixsr-setup\] system:", 1, "Checking the system"),
+    (r"portable Python|python\.tar\.gz", 2, "Downloading Python + numpy (one time)"),
+    (r"\[helixsr-setup\] python:", 5, "Preparing the shader compiler"),
+    (r"dxc-win\.zip", 5, "Downloading the shader compiler (one time)"),
+    (r"shader compiler:", 7, "Starting the build"),
+    (r"downloading nvngx_dlss", 8, "Downloading NVIDIA's DLSS DLL"),
+    (r"1/5 weights", 10, "Step 1/5: extracting weights"),
+    (r"2/5 PTX", 14, "Step 2/5: extracting the network kernels"),
+    (r"3/5 fragment tables", 18, "Step 3/5: fragment tables"),
+    (r"4/5 kernel sources", 40, "Step 4/5: generating shader sources"),
+    (r"5/5 shaders", 50, "Step 5/5: compiling shaders"),
+    (r"HelixSR is ready|now carries the network", 100, "Finished"),
+]
+ERROR_PATTERN = re.compile(r"error|failed|traceback|no such file|not found|denied|mismatch|cannot|killed", re.I)
+
+
+def proc_table():
+    """{pid: (ppid, comm, cmdline, cpu_seconds incl. reaped children)} from /proc; empty where /proc doesn't exist."""
+    table = {}
+    try:
+        tick = os.sysconf("SC_CLK_TCK")
+        pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except (OSError, ValueError, AttributeError):
+        return table
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            comm = stat[stat.index("(") + 1:stat.rindex(")")]
+            f = stat[stat.rindex(")") + 2:].split()
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            table[pid] = (int(f[1]), comm, cmd, sum(int(x) for x in f[11:15]) / tick)
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def setup_processes(table, root=None):
+    """The setup's process tree: below root if given, else any process running HelixSR's setup (also one started by
+    an older plugin version or by hand)."""
+    if root is None:
+        roots = [p for p, (_, _, cmd, _) in table.items()
+                 if ("helixsr-setup.sh" in cmd or "helixsr_setup.py" in cmd) and
+                 "helixsr" not in table.get(table[p][0], (0, "", "", 0))[2]]
+    else:
+        roots = [root] if root in table else []
+    tree, todo = [], list(roots)
+    while todo:
+        p = todo.pop()
+        tree.append(p)
+        todo += [c for c, v in table.items() if v[0] == p]
+    return tree
+
+
+def short_cmd(cmd, comm):
+    """'python3 trace_tables.py' instead of the full command line."""
+    parts = cmd.split()
+    if not parts:
+        return comm
+    names = [os.path.basename(x) for x in parts[:6] if not x.startswith("-")]
+    script = next((n for n in names[1:] if re.search(r"\.(py|sh|exe)$", n)), "")
+    return f"{names[0] if names else comm} {script}".strip()
+
+
+def phase_of(lines):
+    pct, label = 0, "Starting"
+    for line in lines:
+        for pat, p, l in PHASES:
+            if re.search(pat, line) and p >= pct:
+                pct, label = p, l
+    return pct, label
+
+
+def shader_progress():
+    """(compiled, expected) shaders in the newest setup work folder, or None before step 5."""
+    try:
+        works = sorted(SETUP_TMP.glob("helixsr-setup-*"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+    if not works:
+        return None
+    w = works[-1]
+    sources = [p for p in (w / "kernels").rglob("*.hlsl") if not p.name.startswith("w64_")]
+    done = len(list(w.glob("*.cso")))
+    return (done, len(sources) * 2) if sources else None
+
+
+def read_json(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def setup_status():
+    st = read_json(SETUP_STATUS) or {}
+    table = proc_table()
+    tree = setup_processes(table, st.get("pid")) if st.get("pid") else []
+    if not table and st.get("pid") and not SETUP_RC.exists():   # no /proc: just check the wrapper is alive
+        try:
+            os.kill(st["pid"], 0)
+            tree = [st["pid"]]
+        except OSError:
+            pass
+    adopted = False
+    if not tree:
+        stray = setup_processes(table)
+        if stray and not SETUP_RC.exists():
+            tree, adopted = stray, True   # e.g. started by plugin 0.2 or from Konsole
+    try:
+        rc = int(SETUP_RC.read_text().strip()) if SETUP_RC.exists() else None
+    except ValueError:
+        rc = None
+    lines = tail_lines(SETUP_LOG, 2000) if SETUP_LOG.exists() else []
+    pct, label = phase_of(lines)
+    shaders = shader_progress() if tree else None
+    if shaders and label.startswith("Step 5") and shaders[1]:
+        pct = 50 + int(49 * min(1.0, shaders[0] / shaders[1]))
+        label = f"Step 5/5: compiling shaders ({shaders[0]}/{shaders[1]})"
+    tag = st.get("tag")
+    built = bool(tag) and valid_tag(tag) and has_network(version_dir(tag) / "amd_fidelityfx_dx12.dll")
+    if tree:
+        state = "running"
+    elif rc is not None:
+        state = "succeeded" if rc == 0 and built else "failed"
+    elif st.get("cancelled"):
+        state = "cancelled"
+    elif st:
+        state = "stopped"
+    else:
+        state = "idle"
+    log_info = file_info(SETUP_LOG)
+    now = time.time()
+    finished = SETUP_RC.stat().st_mtime if SETUP_RC.exists() else None
+    return {
+        "state": state, "tag": tag, "adopted": adopted, "rc": rc, "built": built,
+        "started": st.get("started"), "finished": finished, "now": now,
+        "progress": 100 if state == "succeeded" else pct, "phase": label,
+        "log_age": (now - log_info["mtime"]) if log_info else None,
+        "cpu_seconds": round(sum(table[p][3] for p in tree if p in table), 1),
+        "processes": [short_cmd(table[p][2], table[p][1]) for p in tree if p in table
+                      and not re.match(r"(bash|sh|wineserver|tee)\b", table[p][1])][:4],
+        "errors": [l.strip() for l in lines if ERROR_PATTERN.search(l)][-6:],
+        "tail": [l for l in lines if l.strip()][-8:],
+        "log_path": str(SETUP_LOG),
+    }
+
+
+def which(name):
+    return shutil.which(name, path=clean_env()["PATH"])
+
+
+def setup_diagnostics():
+    """What the setup depends on, checked the way helixsr-setup.sh looks for it."""
+    data = HOME / ".local/share/HelixSR"
+    out = []
+
+    def add(name, ok, detail):
+        out.append({"name": name, "ok": ok, "detail": detail})
+
+    try:
+        osr = dict(re.findall(r'^(\w+)="?([^"\n]*)"?', Path("/etc/os-release").read_text(), re.M))
+        add("System", True, f"{osr.get('PRETTY_NAME', '?')} {osr.get('VERSION_ID', '')}".strip())
+    except OSError:
+        add("System", True, "unknown (no /etc/os-release)")
+    for label, p in (("Free space (HelixSR folder)", base_dir()), ("Free space (home)", HOME)):
+        try:
+            q = p if p.exists() else p.parent
+            free = shutil.disk_usage(q).free / 1e9
+            add(label, free > 2, f"{free:.1f} GB free in {q}")
+        except OSError as e:
+            add(label, False, str(e))
+    add("curl", bool(which("curl")), which("curl") or "missing: needed for downloads")
+    try:
+        p = subprocess.run(["curl", "-fsSI", "--max-time", "10", "https://github.com"], env=clean_env(),
+                           capture_output=True, timeout=15)
+        add("GitHub reachable", p.returncode == 0, "yes" if p.returncode == 0 else
+            p.stderr.decode(errors="replace").strip()[-200:] or f"curl exit {p.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        add("GitHub reachable", False, str(e))
+    wines = []
+    for pat in (".local/share/Steam/steamapps/common/Proton*/files/bin/wine",
+                ".steam/steam/steamapps/common/Proton*/files/bin/wine",
+                ".local/share/Steam/compatibilitytools.d/*/files/bin/wine",
+                ".steam/root/compatibilitytools.d/*/files/bin/wine"):
+        wines += [str(w) for w in HOME.glob(pat) if os.access(w, os.X_OK)]
+    add("Proton (runs the shader compiler)", bool(wines), wines[0] if wines else
+        "no Proton found: install any Proton version in Steam (e.g. run a Windows game once)")
+    py = data / "python/bin/python3"
+    for label, exe in (("Portable Python", py), ("System Python", which("python3"))):
+        if not exe or not Path(exe).exists():
+            add(label, label == "System Python", "not installed" + (" (downloaded by the setup)" if
+                                                                     label == "Portable Python" else ""))
+            continue
+        try:
+            p = subprocess.run([str(exe), "-c", "import sys, numpy; print(sys.version.split()[0], numpy.__version__)"],
+                               env=clean_env(), capture_output=True, timeout=30)
+            ok = p.returncode == 0
+            add(label, ok or label == "System Python",
+                f"{exe}: Python/numpy {p.stdout.decode().strip()}" if ok else f"{exe}: no numpy")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            add(label, False, f"{exe}: {e}")
+    dxc = data / "dxc-win/bin/x64/dxc.exe"
+    add("Shader compiler", True, f"{dxc}" if dxc.exists() else "not downloaded yet (the setup downloads it)")
+    leaked = [k for k in ("PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH") if k in os.environ]
+    add("Decky environment", True, ("cleaned for the setup: " + ", ".join(leaked)) if leaked else "clean")
+    st = setup_status()
+    add("Setup", st["state"] in ("idle", "running", "succeeded"),
+        f"{st['state']}" + (f", exit code {st['rc']}" if st["rc"] is not None else "") +
+        (f", release {st['tag']}" if st["tag"] else ""))
+    return out
+
+
+def write_debug_report():
+    st = setup_status()
+    lines = [f"HelixSR Manager {getattr(decky, "DECKY_PLUGIN_VERSION", "?")} debug report, {time.ctime()}", "",
+             "== Setup status", json.dumps(st, indent=1, default=str), "", "== Diagnostics"]
+    lines += [f"[{'ok' if d['ok'] else 'PROBLEM'}] {d['name']}: {d['detail']}" for d in setup_diagnostics()]
+    lines += ["", "== Downloaded releases", json.dumps(local_versions(), indent=1), "", f"== {SETUP_LOG}"]
+    lines += tail_lines(SETUP_LOG, 3000) if SETUP_LOG.exists() else ["(no setup log)"]
+    out = base_dir() / "helixsr-manager-debug.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n")
+    return out
+
+
+
+# --- clean ------------------------------------------------------------------------------------------------------------
+
+# what a HelixSR release zip (1.2.0 - 1.4.1) and its setup put into a release folder
+RELEASE_FILES = {"amd_fidelityfx_dx12.dll", "helixsr.ini", "helixsr_weights.bin", "helixsr_kernels.pak",
+                 "helixsr_setup.json", "LICENSE", "LICENSE-APACHE-2.0", "README.md", "SOURCE.md",
+                 "THIRD_PARTY_NOTICES.md", "helixsr-setup.sh", "helixsr-setup.bat", "helixsr-setup.ps1",
+                 "helixsr-install.sh", "helixsr-install.bat", "helixsr.log"}
+
+
+def tree_size(p):
+    p = Path(p)
+    if p.is_file() or p.is_symlink():
+        return p.lstat().st_size
+    total = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def is_release_folder(d):
+    return (d / "helixsr-setup.sh").exists() or (d / "setup" / "helixsr_setup.py").exists() or \
+        ((d / "amd_fidelityfx_dx12.dll").exists() and is_helixsr(d / "amd_fidelityfx_dx12.dll"))
+
+
+def clean_targets():
+    """Everything the plugin and HelixSR's setup downloaded or built. Only things recognizably HelixSR's: the base
+    folder may be one the user picked, so it is never removed as a whole while it holds anything else."""
+    base = base_dir()
+    out = []
+    if base.is_dir():
+        for d in base.iterdir():
+            if d.is_dir() and valid_tag(d.name) and is_release_folder(d):
+                out.append(d)
+        if is_release_folder(base):   # the plugin 0.1 layout: a release extracted straight into the base folder
+            out += [base / n for n in RELEASE_FILES if (base / n).exists()]
+            if (base / "setup" / "helixsr_setup.py").exists():
+                out.append(base / "setup")
+        if (base / "helixsr-manager-debug.txt").exists():
+            out.append(base / "helixsr-manager-debug.txt")
+    data = HOME / ".local/share/HelixSR"   # the setup's portable Python, shader compiler and Wine prefix
+    if data.is_dir():
+        out.append(data)
+    for p in (SETUP_TMP, *RUNTIME_DIR.glob("*.zip")):
+        if Path(p).exists():
+            out.append(Path(p))
+    return out
+
+
+def clean_all():
+    targets = clean_targets()
+    freed = sum(tree_size(p) for p in targets)
+    for p in targets:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    base = base_dir()
+    try:
+        if base.is_dir() and not any(base.iterdir()):
+            base.rmdir()
+    except OSError:
+        pass
+    for f in (SETUP_STATUS, SETUP_RC):
+        f.unlink(missing_ok=True)
+    s = load_settings()
+    s.pop("active", None)
+    save_settings(s)
+    return len(targets), freed
+
+
+
 # --- plugin -----------------------------------------------------------------------------------------------------------
 
 class Plugin:
-    setup_proc = None
-    setup_rc = None
-    setup_started = None
-    setup_tag = None
     games_cache = {}
 
     async def _main(self):
         decky.logger.info("HelixSR Manager loaded")
 
     async def _unload(self):
-        await self.cancel_setup()
+        pass   # a running setup keeps going (it records its own result); the panel picks it up again
 
     # settings / HelixSR itself
 
     async def get_helix_state(self):
         s = helix_state()
-        s["setup_running"] = self.setup_proc is not None and self.setup_proc.returncode is None
-        s["setup_tag"] = self.setup_tag
-        s["setup_rc"] = self.setup_rc
-        s["setup_log"] = tail_lines(SETUP_LOG, 12) if SETUP_LOG.exists() else []
+        s["setup"] = await asyncio.to_thread(setup_status)
         return s
 
     async def set_helix_dir(self, path):
@@ -760,7 +1068,8 @@ class Plugin:
     async def delete_release(self, tag):
         try:
             d = version_dir(tag)
-            if self.setup_proc is not None and self.setup_proc.returncode is None and self.setup_tag == tag:
+            st = setup_status()
+            if st["state"] == "running" and st["tag"] in (tag, None):
                 raise RuntimeError("Its setup is running.")
             if tag == LEGACY_TAG or not d.is_dir() or base_dir().resolve() not in d.resolve().parents:
                 raise RuntimeError("Only release folders this plugin downloaded can be deleted here.")
@@ -770,7 +1079,7 @@ class Plugin:
             return {"ok": False, "error": str(e)}
 
     async def start_setup(self, tag):
-        if self.setup_proc is not None and self.setup_proc.returncode is None:
+        if (await asyncio.to_thread(setup_status))["state"] == "running":
             return {"ok": False, "error": "A setup is already running."}
         try:
             d = version_dir(tag)
@@ -780,34 +1089,79 @@ class Plugin:
         if not script.exists():
             return {"ok": False, "error": f"helixsr-setup.sh not found. Download HelixSR {tag} first."}
         SETUP_LOG.parent.mkdir(parents=True, exist_ok=True)
-        log = open(SETUP_LOG, "wb")
-        log.write(f"[decky] {time.ctime()}: running {script} --yes\n".encode())
-        log.flush()
-        # --yes: the user agreed to NVIDIA's DLSS download in the confirmation dialog
-        self.setup_proc = await asyncio.create_subprocess_exec(
-            "bash", str(script), str(d), "--yes", cwd=str(d), env=clean_env(),
-            stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        log.close()
-        self.setup_tag = tag
-        self.setup_rc = None
-        self.setup_started = time.time()
-        asyncio.get_event_loop().create_task(self._wait_setup(self.setup_proc, d))
+        SETUP_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(SETUP_TMP, ignore_errors=True)
+        SETUP_TMP.mkdir()
+        if SETUP_RC.exists():
+            SETUP_RC.unlink()
+        env = clean_env()
+        env["TMPDIR"] = str(SETUP_TMP)
+        with open(SETUP_LOG, "wb") as log:
+            log.write(f"[decky] {time.ctime()}: running {script} {d} --yes\n".encode())
+            log.flush()
+            # A wrapper shell records the exit code in a file, so the result is known even if Decky restarts the
+            # plugin meanwhile. --yes: the user agreed to NVIDIA's DLSS download in the confirmation dialog.
+            proc = subprocess.Popen(
+                ["bash", "-c", 'bash "$0" "$1" --yes; echo $? > "$2"', str(script), str(d), str(SETUP_RC)],
+                cwd=str(d), env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True)
+        SETUP_STATUS.write_text(json.dumps({"tag": tag, "pid": proc.pid, "started": time.time()}))
+        asyncio.get_event_loop().create_task(self._wait_setup(proc))
         return {"ok": True}
 
-    async def _wait_setup(self, proc, d):
-        rc = await proc.wait()
-        self.setup_rc = rc
-        ok = rc == 0 and has_network(d / "amd_fidelityfx_dx12.dll")
-        await decky.emit("setup_done", ok)
+    async def _wait_setup(self, proc):
+        await asyncio.to_thread(proc.wait)
+        st = await asyncio.to_thread(setup_status)
+        await decky.emit("setup_done", st["state"] == "succeeded")
 
     async def cancel_setup(self):
-        p = self.setup_proc
-        if p is not None and p.returncode is None:
+        st = read_json(SETUP_STATUS) or {}
+        table = proc_table()
+        tree = setup_processes(table, st.get("pid")) if st.get("pid") else []
+        tree = tree or setup_processes(table)
+        if st:
+            st["cancelled"] = True
+            SETUP_STATUS.write_text(json.dumps(st))
+        for pid in reversed(tree):
             try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if st.get("pid"):
+            try:
+                os.killpg(st["pid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
                 pass
         return True
+
+    async def clean_preview(self):
+        def work():
+            t = clean_targets()
+            return {"items": [str(p) for p in t], "bytes": sum(tree_size(p) for p in t)}
+        return await asyncio.to_thread(work)
+
+    async def clean(self):
+        if (await asyncio.to_thread(setup_status))["state"] == "running":
+            return {"ok": False, "error": "A setup is running. Cancel it first."}
+        try:
+            n, freed = await asyncio.to_thread(clean_all)
+            return {"ok": True, "message": f"Removed {n} item(s), freed {freed / 1048576:.0f} MB. "
+                                           f"Games with HelixSR installed keep working."}
+        except Exception as e:
+            decky.logger.exception("clean")
+            return {"ok": False, "error": str(e)}
+
+    async def get_setup_log(self):
+        return {"path": str(SETUP_LOG), "lines": tail_lines(SETUP_LOG, 400) if SETUP_LOG.exists() else []}
+
+    async def run_diagnostics(self):
+        return await asyncio.to_thread(setup_diagnostics)
+
+    async def save_debug_report(self):
+        try:
+            return {"ok": True, "message": f"Saved to {await asyncio.to_thread(write_debug_report)}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     # games
 

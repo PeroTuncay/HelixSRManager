@@ -3,15 +3,19 @@ import {
   ConfirmModal,
   DropdownItem,
   Field,
+  Focusable,
+  ModalRoot,
   PanelSection,
   PanelSectionRow,
+  ProgressBarWithInfo,
+  Spinner,
   TextField,
   ToggleField,
   showModal,
   staticClasses,
 } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FaDna } from "react-icons/fa";
 
 // --- backend types and calls -------------------------------------------------------------------------------------------
@@ -38,11 +42,29 @@ type HelixState = {
   version: string | null;
   built: boolean;
   setup_script: boolean;
-  setup_running: boolean;
-  setup_tag: string | null;
-  setup_rc: number | null;
-  setup_log: string[];
+  setup: SetupStatus;
 };
+
+type SetupStatus = {
+  state: "idle" | "running" | "succeeded" | "failed" | "cancelled" | "stopped";
+  tag: string | null;
+  adopted: boolean;
+  rc: number | null;
+  built: boolean;
+  started: number | null;
+  finished: number | null;
+  now: number;
+  progress: number;
+  phase: string;
+  log_age: number | null;
+  cpu_seconds: number;
+  processes: string[];
+  errors: string[];
+  tail: string[];
+  log_path: string;
+};
+
+type Diagnostic = { name: string; ok: boolean; detail: string };
 
 type Check = {
   exists: boolean;
@@ -103,6 +125,11 @@ const downloadRelease = callable<[tag: string], Result>("download_release");
 const deleteRelease = callable<[tag: string], Result>("delete_release");
 const startSetup = callable<[tag: string], Result>("start_setup");
 const cancelSetup = callable<[], boolean>("cancel_setup");
+const getSetupLog = callable<[], { path: string; lines: string[] }>("get_setup_log");
+const runDiagnostics = callable<[], Diagnostic[]>("run_diagnostics");
+const saveDebugReport = callable<[], Result>("save_debug_report");
+const cleanPreview = callable<[], { items: string[]; bytes: number }>("clean_preview");
+const cleanAll = callable<[], Result>("clean");
 const listGames = callable<[], GameSummary[]>("list_games");
 const getGame = callable<[appid: string], GameDetail>("get_game");
 const installDirect = callable<[path: string], Result>("install_direct");
@@ -182,6 +209,245 @@ function FolderModal({ initial, closeModal, onSave }: { initial: string; closeMo
   );
 }
 
+function duration(sec: number) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+}
+
+// A long text the controller can scroll through: one focusable block per chunk, so D-pad down moves through it.
+function ScrollText({ lines }: { lines: string[] }) {
+  const chunks: string[][] = [];
+  for (let i = 0; i < lines.length; i += 20) chunks.push(lines.slice(i, i + 20));
+  return (
+    <div style={{ maxHeight: "60vh", overflowY: "auto" }}>
+      {chunks.length === 0 && <div style={mono}>(empty)</div>}
+      {chunks.map((c, i) => (
+        <Focusable key={i} onActivate={() => {}} style={{ ...mono, borderRadius: 0, marginBottom: 1 }}>
+          {c.join("\n")}
+        </Focusable>
+      ))}
+    </div>
+  );
+}
+
+function LogModal({ closeModal }: { closeModal?: () => void }) {
+  const [log, setLog] = useState<{ path: string; lines: string[] } | null>(null);
+  useEffect(() => {
+    getSetupLog().then(setLog);
+  }, []);
+  return (
+    <ModalRoot closeModal={closeModal}>
+      <div className={staticClasses.Title} style={{ marginBottom: 4 }}>Setup log</div>
+      <div style={{ ...small, marginBottom: 8 }}>{log?.path ?? "Loading…"}</div>
+      {log && <ScrollText lines={log.lines} />}
+    </ModalRoot>
+  );
+}
+
+function DiagnosticsModal({ closeModal }: { closeModal?: () => void }) {
+  const [items, setItems] = useState<Diagnostic[] | null>(null);
+  useEffect(() => {
+    runDiagnostics().then(setItems);
+  }, []);
+  return (
+    <ModalRoot closeModal={closeModal}>
+      <div className={staticClasses.Title} style={{ marginBottom: 8 }}>Setup diagnostics</div>
+      {!items ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", ...small }}>
+          <Spinner style={{ width: 20, height: 20 }} /> Checking…
+        </div>
+      ) : (
+        <div style={{ maxHeight: "60vh", overflowY: "auto" }}>
+          {items.map((d) => (
+            <Focusable key={d.name} onActivate={() => {}} style={{ ...small, padding: "4px 0" }}>
+              <span style={{ color: d.ok ? "#5ba32b" : "#d94126", fontWeight: 600 }}>
+                {d.ok ? "✓" : "✗"} {d.name}
+              </span>
+              <div style={{ wordBreak: "break-all" }}>{d.detail}</div>
+            </Focusable>
+          ))}
+        </div>
+      )}
+    </ModalRoot>
+  );
+}
+
+function CleanModal({ closeModal, onDone }: { closeModal?: () => void; onDone: () => void }) {
+  const [preview, setPreview] = useState<{ items: string[]; bytes: number } | null>(null);
+  useEffect(() => {
+    cleanPreview().then(setPreview);
+  }, []);
+  const empty = preview !== null && preview.items.length === 0;
+  return (
+    <ConfirmModal
+      strTitle="Remove all downloaded files?"
+      strDescription={
+        empty
+          ? "Nothing to remove."
+          : "Deletes every downloaded HelixSR release with its built network, plus the setup's Python, shader " +
+            "compiler and temporary files. Games that have HelixSR installed keep working (they have their own copy); " +
+            "to use another release later, download it and run its setup again."
+      }
+      strOKButtonText={preview ? `Remove (${(preview.bytes / 1048576).toFixed(0)} MB)` : "Remove"}
+      bOKDisabled={!preview || empty}
+      closeModal={closeModal}
+      onOK={async () => {
+        toast(await cleanAll(), "Clean");
+        onDone();
+      }}
+    >
+      {preview && !empty && <ScrollText lines={preview.items} />}
+    </ConfirmModal>
+  );
+}
+
+function SetupPanel({ s, refresh }: { s: SetupStatus; refresh: () => void }) {
+  // the backend's clock vs. ours, so the elapsed time ticks every second between polls
+  const offset = useMemo(() => s.now - Date.now() / 1000, [s.now]);
+  const [, tick] = useState(0);
+  const cpuHistory = useRef<{ t: number; cpu: number }[]>([]);
+  const running = s.state === "running";
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  useEffect(() => {
+    const h = cpuHistory.current;
+    h.push({ t: s.now, cpu: s.cpu_seconds });
+    while (h.length > 2 && s.now - h[0].t > 90) h.shift();
+  }, [s.now, s.cpu_seconds]);
+
+  const now = Date.now() / 1000 + offset;
+  const elapsed = s.started ? (s.finished ?? now) - s.started : null;
+  const h = cpuHistory.current;
+  const span = h.length > 1 ? h[h.length - 1].t - h[0].t : 0;
+  const cpuRate = span >= 20 ? (h[h.length - 1].cpu - h[0].cpu) / span : null; // CPU seconds per second
+  const busy = cpuRate !== null && cpuRate > 0.05;
+  const stuck = running && cpuRate !== null && !busy && (s.log_age ?? 0) > 600;
+
+  const tools = (
+    <>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => showModal(<LogModal />)}>
+          Show full log
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => showModal(<DiagnosticsModal />)}>
+          Run diagnostics
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={async () => toast(await saveDebugReport(), "Debug report")}>
+          Save debug report
+        </ButtonItem>
+      </PanelSectionRow>
+    </>
+  );
+
+  if (running) {
+    return (
+      <>
+        <PanelSectionRow>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, ...small, color: "#dcdedf", fontWeight: 600 }}>
+            <Spinner style={{ width: 22, height: 22, flexShrink: 0 }} />
+            <span>Setup {s.tag ?? ""} running{s.adopted ? " (started outside this plugin version)" : ""}</span>
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ProgressBarWithInfo
+            nProgress={s.progress}
+            indeterminate={s.progress === 0}
+            sOperationText={s.phase}
+            sTimeRemaining={elapsed !== null ? `${duration(elapsed)} elapsed` : undefined}
+          />
+        </PanelSectionRow>
+        <Note>
+          <div>
+            Activity:{" "}
+            {cpuRate === null ? (
+              "measuring…"
+            ) : busy ? (
+              <span style={{ color: "#5ba32b" }}>working (CPU {Math.round(cpuRate * 100)}%)</span>
+            ) : (
+              <span style={{ color: "#e5a50a" }}>idle (waiting, or downloading)</span>
+            )}
+            {" · "}CPU time {duration(s.cpu_seconds)}
+          </div>
+          {s.log_age !== null && <div>Last log line {duration(s.log_age)} ago</div>}
+          {s.processes.length > 0 && <div>Running now: {s.processes.join(", ")}</div>}
+          <div>Steps print nothing while they work, so the log can stay unchanged for minutes.</div>
+        </Note>
+        {stuck && (
+          <Note>
+            <span style={{ color: "#d94126" }}>
+              No CPU activity and no log output for {duration(s.log_age ?? 0)}: the setup looks stuck. Check the full
+              log and diagnostics, then cancel and retry (or run it once from Konsole in Desktop Mode).
+            </span>
+          </Note>
+        )}
+        {s.tail.length > 0 && (
+          <PanelSectionRow>
+            <div style={mono}>{s.tail.slice(-5).join("\n")}</div>
+          </PanelSectionRow>
+        )}
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={async () => {
+              await cancelSetup();
+              refresh();
+            }}
+          >
+            Cancel setup
+          </ButtonItem>
+        </PanelSectionRow>
+        {tools}
+      </>
+    );
+  }
+
+  if (s.state === "idle") return null;
+  const outcome: Record<Exclude<SetupStatus["state"], "idle" | "running">, { color: string; text: string }> = {
+    succeeded: {
+      color: "#5ba32b",
+      text: `Setup of ${s.tag} finished${elapsed ? ` in ${duration(elapsed)}` : ""}: network built`,
+    },
+    failed: {
+      color: "#d94126",
+      text:
+        s.rc === 0
+          ? `Setup of ${s.tag} ended, but the DLL has no network`
+          : `Setup of ${s.tag} failed (exit code ${s.rc})${elapsed ? ` after ${duration(elapsed)}` : ""}`,
+    },
+    cancelled: { color: "#e5a50a", text: `Setup of ${s.tag} was cancelled` },
+    stopped: {
+      color: "#e5a50a",
+      text: `Setup of ${s.tag} stopped without finishing (the Deck restarted, or the process was killed). Run it again.`,
+    },
+  };
+  const o = outcome[s.state as keyof typeof outcome];
+  return (
+    <>
+      <Note>
+        <span style={{ color: o.color, fontWeight: 600 }}>{o.text}</span>
+      </Note>
+      {s.state !== "succeeded" && (s.errors.length > 0 || s.tail.length > 0) && (
+        <PanelSectionRow>
+          <div style={mono}>{(s.errors.length > 0 ? s.errors : s.tail.slice(-5)).join("\n")}</div>
+        </PanelSectionRow>
+      )}
+      {tools}
+    </>
+  );
+}
+
 function HelixSection({ state, refresh }: { state: HelixState | null; refresh: () => void }) {
   const [busy, setBusy] = useState(false);
   const [releases, setReleases] = useState<Release[] | null>(null);
@@ -197,11 +463,12 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
     loadReleases();
   }, [loadReleases]);
 
+  const setupRunning = state?.setup.state === "running";
   useEffect(() => {
-    if (!state?.setup_running) return;
+    if (!setupRunning) return;
     const id = setInterval(refresh, 2000);
     return () => clearInterval(id);
-  }, [state?.setup_running, refresh]);
+  }, [setupRunning, refresh]);
 
   if (!state) return <PanelSection title="HelixSR"><Note>Loading…</Note></PanelSection>;
 
@@ -224,7 +491,7 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
 
   const tag = state.active;
   const rel = releases?.find((r) => r.tag === tag);
-  const setupHere = state.setup_running && state.setup_tag === tag;
+  const setupHere = setupRunning && state.setup.tag === tag;
 
   const choose = async (t: string) => {
     await setActive(t);
@@ -261,7 +528,8 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
         strDescription={
           "HelixSR's setup downloads NVIDIA's DLSS 310.7.0 DLL from NVIDIA's GitHub (NVIDIA's license applies), " +
           "plus a portable Python with numpy and Microsoft's shader compiler, builds the network into the HelixSR DLL " +
-          "and deletes NVIDIA's DLL again. Takes about 4-5 minutes; keep the Deck awake and plugged in. " +
+          "and deletes NVIDIA's DLL again. About 4-5 minutes on a desktop CPU, likely longer on the Deck. Keep the " +
+          "Deck plugged in and don't let it sleep (sleep pauses the setup); you can close this menu meanwhile. " +
           "The resulting DLL contains NVIDIA's network: it is for this device only, don't share it."
         }
         strOKButtonText="Download and build"
@@ -284,7 +552,7 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
             rgOptions={tags.map((t) => ({ data: t, label: label(t) }))}
             selectedOption={tag ?? undefined}
             strDefaultLabel="Select a release"
-            disabled={state.setup_running}
+            disabled={setupRunning}
             onChange={(o) => choose(o.data)}
           />
         )}
@@ -304,36 +572,21 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
         {offline && <div>GitHub not reachable: showing the last known releases.</div>}
         <div>{state.base}</div>
       </Note>
-      {tag && rel && !state.setup_running && (
+      {tag && rel && !setupRunning && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={download}>
             {busy ? "Downloading…" : state.downloaded ? `Download ${tag} again` : `Download ${tag}`}
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {state.setup_script && !state.setup_running && (
+      {state.setup_script && !setupRunning && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={setup}>
             {state.built ? "Run setup again" : "Run setup (build network)"}
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {state.setup_running && (
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={async () => { await cancelSetup(); refresh(); }}>
-            Cancel setup of {state.setup_tag}
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-      {(setupHere || (state.setup_rc !== null && state.setup_rc !== 0 && state.setup_tag === tag)) &&
-        state.setup_log.length > 0 && (
-          <PanelSectionRow>
-            <div style={mono}>
-              {state.setup_running ? "Setup running…\n" : `Setup failed (exit ${state.setup_rc})\n`}
-              {state.setup_log.join("\n")}
-            </div>
-          </PanelSectionRow>
-        )}
+      <SetupPanel s={state.setup} refresh={refresh} />
       {state.downloaded && tag !== "local" && !setupHere && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={remove}>
@@ -341,14 +594,21 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {!state.setup_running && (
+      {!setupRunning && (
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={loadReleases}>
             Check GitHub for releases
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {!state.setup_running && (
+      {!setupRunning && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => showModal(<CleanModal onDone={refresh} />)}>
+            Clean: remove all downloaded files
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      {!setupRunning && (
         <PanelSectionRow>
           <ButtonItem
             layout="below"
