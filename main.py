@@ -915,7 +915,8 @@ def setup_diagnostics():
 
 def write_debug_report():
     st = setup_status()
-    lines = [f"HelixSR Manager {getattr(decky, "DECKY_PLUGIN_VERSION", "?")} debug report, {time.ctime()}", "",
+    version = getattr(decky, "DECKY_PLUGIN_VERSION", "?")
+    lines = [f"HelixSR Manager {version} debug report, {time.ctime()}", "",
              "== Setup status", json.dumps(st, indent=1, default=str), "", "== Diagnostics"]
     lines += [f"[{'ok' if d['ok'] else 'PROBLEM'}] {d['name']}: {d['detail']}" for d in setup_diagnostics()]
     lines += ["", "== Downloaded releases", json.dumps(local_versions(), indent=1), "", f"== {SETUP_LOG}"]
