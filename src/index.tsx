@@ -72,9 +72,16 @@ type Check = {
   mtime?: number;
   highlights: string[];
   tail: string[];
+  last_upscale?: { render: string; output: string; ratio: number; mode: string; network: string | null } | null;
 };
 
-type IniValues = { exists: boolean; network_resolution: string; sharpening: string; upscaler_dll: string };
+type IniValues = {
+  exists: boolean;
+  network_resolution: string;
+  sharpening: string;
+  upscaler_dll: string;
+  model_e_enabled: boolean;
+};
 
 type DirectTarget = {
   path: string;
@@ -634,14 +641,30 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
 
 // --- per-install pieces ------------------------------------------------------------------------------------------------
 
-function CheckBlock({ check }: { check: Check }) {
+function CheckBlock({ check, ini }: { check: Check; ini: IniValues }) {
   const s = STATUS[check.status];
+  const u = check.last_upscale;
   return (
     <>
+      {!ini.model_e_enabled && (
+        <Note>
+          <span style={{ color: "#e5a50a", fontWeight: 600 }}>
+            Test mode: the DLSS network is switched off. After a game restart the picture should be HelixSR's simple,
+            blurry placeholder upscale. If it looks unchanged, HelixSR isn't the active upscaler. Switch it back on
+            when you're done.
+          </span>
+        </Note>
+      )}
       <PanelSectionRow>
         <div style={small}>
           <span style={{ color: s.color, fontWeight: 600 }}>● {s.text}</span>
           {check.mtime && <div>helixsr.log written {new Date(check.mtime * 1000).toLocaleString()}</div>}
+          {u && (
+            <div>
+              Last upscale: {u.render} → {u.output} ({u.mode}, {u.ratio}x)
+              {u.network && <div>Network: {u.network}</div>}
+            </div>
+          )}
         </div>
       </PanelSectionRow>
       {check.highlights.length > 0 && (
@@ -660,6 +683,14 @@ function IniControls({ folder, ini, onChange }: { folder: string; ini: IniValues
   };
   return (
     <>
+      <PanelSectionRow>
+        <ToggleField
+          label="DLSS network (Model E)"
+          description="Turn off to prove HelixSR is upscaling: it then falls back to a simple, blurry upscale. Takes effect after restarting the game; for live comparisons switch upscalers in OptiScaler's menu."
+          checked={ini.model_e_enabled}
+          onChange={(on) => save("model_e", on ? "true" : "false")}
+        />
+      </PanelSectionRow>
       <PanelSectionRow>
         <DropdownItem
           label="Network resolution"
@@ -736,7 +767,7 @@ function DirectSection({ items, active, reload }: { items: DirectTarget[]; activ
             )}
             {installed && (
               <>
-                <CheckBlock check={t.check} />
+                <CheckBlock check={t.check} ini={t.ini} />
                 <IniControls folder={t.path.replace(/\/[^/]+$/, "")} ini={t.ini} onChange={reload} />
               </>
             )}
@@ -815,7 +846,7 @@ function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload
       )}
       {o.configured && (
         <>
-          <CheckBlock check={o.check} />
+          <CheckBlock check={o.check} ini={o.ini} />
           <Note>
             In game, open the OptiScaler menu: Upscalers → FFX Upscaler should read "FSR HelixSR (3.1.5)". A red frame
             around the picture means the network isn't built.

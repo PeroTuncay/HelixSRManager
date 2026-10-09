@@ -495,7 +495,37 @@ def helix_log_check(folder):
             seen.add(k)
             uniq.append(l)
     return {"exists": True, "mtime": info["mtime"], "status": status, "highlights": list(reversed(uniq[:12])),
-            "tail": lines[-15:]}
+            "tail": lines[-15:], "last_upscale": last_upscale(lines)}
+
+
+QUALITY_MODES = [(1.0, "native / DLAA"), (1.5, "Quality"), (1.7, "Balanced"), (2.0, "Performance"),
+                 (3.0, "Ultra Performance")]
+
+
+def last_upscale(lines):
+    """What HelixSR was last asked to do: render -> output size (its 'create:' line), the FSR quality mode that ratio
+    matches, and the network state from its 'summary:' / 'model-e:' lines. None before any upscaler was created."""
+    out = None
+    for line in lines:
+        m = re.search(r"create: max render (\d+)x(\d+) -> upscale (\d+)x(\d+)", line)
+        if m and "dry run" not in line:
+            rw, rh, ow, oh = map(int, m.groups())
+            ratio = ow / rw if rw else 0
+            mode = min(QUALITY_MODES, key=lambda q: abs(q[0] - ratio))[1] if ratio else "?"
+            out = {"render": f"{rw}x{rh}", "output": f"{ow}x{oh}", "ratio": round(ratio, 2), "mode": mode,
+                   "network": None}
+            continue
+        if out is None:
+            continue
+        m = re.search(r"model-e: network running \(([^,)]+)", line)
+        if m:
+            out["network"] = f"running ({m.group(1)} network)"
+        m = re.search(r"summary: .*?\| network: ([^|]+)", line)
+        if m:
+            out["network"] = m.group(1).strip()
+        if "placeholder" in line or "NOT RUNNING" in line:
+            out["network"] = "NOT RUNNING (placeholder upscale)"
+    return out
 
 
 def opti_log_check(opti_dir):
@@ -519,12 +549,15 @@ def opti_log_check(opti_dir):
 def helix_ini_values(folder):
     ini = Path(folder) / "helixsr.ini"
     if not ini.exists():
-        return {"exists": False, "network_resolution": "auto", "sharpening": "off", "upscaler_dll": ""}
+        return {"exists": False, "network_resolution": "auto", "sharpening": "off", "upscaler_dll": "",
+                "model_e_enabled": True}
     t = read_text(ini)
     return {"exists": True,
             "network_resolution": ini_get(t, "Upscaling", "NetworkResolution") or "auto",
             "sharpening": ini_get(t, "Sharpening", "Mode") or "off",
-            "upscaler_dll": ini_get(t, "Forwarding", "UpscalerDll") or ""}
+            "upscaler_dll": ini_get(t, "Forwarding", "UpscalerDll") or "",
+            # HelixSR's default is on; anything but an explicit false counts as on
+            "model_e_enabled": (ini_get(t, "ModelE", "Enabled") or "true").strip().lower() != "false"}
 
 
 # --- OptiScaler -------------------------------------------------------------------------------------------------------
@@ -1278,6 +1311,8 @@ class Plugin:
                 text = ini_set(text, "Upscaling", "NetworkResolution", value)
             elif option == "sharpening" and value in SHARPENING_MODES:
                 text = ini_set(text, "Sharpening", "Mode", value)
+            elif option == "model_e" and value in ("true", "false"):
+                text = ini_set(text, "ModelE", "Enabled", value)
             else:
                 raise RuntimeError("Unknown option.")
             write_text(ini, text)

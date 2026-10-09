@@ -45,6 +45,15 @@ filter to see all).
 After playing for a moment, press **Check again** in the plugin. Green **HelixSR network running** means it works. A
 red frame around the picture, or a red status, means the network isn't running; the plugin shows what HelixSR logged.
 
+The check also shows what HelixSR last upscaled, e.g. "853x533 → 1280x800 (Quality, 1.5x), Network: Model E main".
+
+**To prove HelixSR (and not FSR) is doing the upscaling**, turn off **DLSS network (Model E)** for that game and
+restart it. HelixSR then falls back to a simple, blurry placeholder upscale: if the picture changes, HelixSR is the
+active upscaler; if it looks the same, a different upscaler is selected. Turn the network back on afterwards. The switch
+only takes effect when the game starts. For a live side-by-side comparison, switch between "FSR HelixSR (3.1.5)" and
+FSR 3.1.5 / FSR 4 in OptiScaler's menu (Upscalers → FFX Upscaler); an entry named just "FSR 3.1.5" is AMD's FSR 3.1,
+not HelixSR.
+
 To undo: **Revert OptiScaler to previous upscaler** or **Restore the game's FSR**.
 
 ## What it does
@@ -81,7 +90,8 @@ To undo: **Revert OptiScaler to previous upscaler** or **Restore the game's FSR*
    HelixSR's are removed from the HelixSR folder.
 7. **Check**: reads `helixsr.log` (network running / not running / loaded but idle, wave size, network resolution) and,
    if enabled, OptiScaler.log lines about HelixSR/FFX.
-8. **Settings**: `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per install.
+8. **Settings**: the DLSS network on/off test switch, `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per
+   install.
 
 ## Build
 
