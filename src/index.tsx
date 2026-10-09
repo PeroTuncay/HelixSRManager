@@ -18,13 +18,28 @@ import { FaDna } from "react-icons/fa";
 
 type Result = { ok: boolean; message?: string; error?: string };
 
+type LocalVersion = { tag: string; dir: string; version: string | null; built: boolean; setup_script: boolean };
+
+type Release = {
+  tag: string;
+  name: string;
+  url: string;
+  size: number | null;
+  published_at: string | null;
+  prerelease: boolean;
+};
+
 type HelixState = {
-  dir: string;
+  base: string;
+  active: string | null;
+  versions: LocalVersion[];
+  dir: string | null;
   downloaded: boolean;
   version: string | null;
   built: boolean;
   setup_script: boolean;
   setup_running: boolean;
+  setup_tag: string | null;
   setup_rc: number | null;
   setup_log: string[];
 };
@@ -44,7 +59,6 @@ type DirectTarget = {
   rel: string;
   state: "original" | "helixsr" | "helixsr_no_backup" | "conflict";
   helix_version: string | null;
-  outdated: boolean;
   near_optiscaler: boolean;
   size: number;
   check: Check;
@@ -70,6 +84,8 @@ type OptiTarget = {
   helix_folder: string;
 };
 
+type Active = { ready: boolean; tag: string | null; version: string | null };
+
 type GameSummary = { appid: string; name: string; path: string; fsr: boolean; optiscaler: boolean; helixsr: boolean };
 type GameDetail = Result & {
   appid: string;
@@ -81,9 +97,11 @@ type GameDetail = Result & {
 
 const getHelixState = callable<[], HelixState>("get_helix_state");
 const setHelixDir = callable<[path: string], HelixState>("set_helix_dir");
-const checkLatest = callable<[], Result & { tag?: string }>("check_latest");
-const downloadHelixsr = callable<[], Result>("download_helixsr");
-const startSetup = callable<[], Result>("start_setup");
+const listReleases = callable<[], Result & { offline: boolean; releases: Release[] }>("list_releases");
+const setActive = callable<[tag: string], Result>("set_active");
+const downloadRelease = callable<[tag: string], Result>("download_release");
+const deleteRelease = callable<[tag: string], Result>("delete_release");
+const startSetup = callable<[tag: string], Result>("start_setup");
 const cancelSetup = callable<[], boolean>("cancel_setup");
 const listGames = callable<[], GameSummary[]>("list_games");
 const getGame = callable<[appid: string], GameDetail>("get_game");
@@ -134,6 +152,11 @@ function store(key: string, value: string) {
   }
 }
 
+function notReady(a: Active) {
+  if (!a.tag) return "Select a HelixSR release first";
+  return a.version ? `Run the setup for ${a.tag} first` : `Download ${a.tag} first`;
+}
+
 function Note({ children }: { children: React.ReactNode }) {
   return (
     <PanelSectionRow>
@@ -149,7 +172,7 @@ function FolderModal({ initial, closeModal, onSave }: { initial: string; closeMo
   return (
     <ConfirmModal
       strTitle="HelixSR folder"
-      strDescription="Where the HelixSR release lives (and where its setup builds the DLL). Leave empty for ~/HelixSR."
+      strDescription="Each downloaded release gets its own subfolder here (v1.4.1, ...), built by its setup. Leave empty for ~/HelixSR."
       strOKButtonText="Save"
       closeModal={closeModal}
       onOK={() => onSave(value)}
@@ -161,11 +184,18 @@ function FolderModal({ initial, closeModal, onSave }: { initial: string; closeMo
 
 function HelixSection({ state, refresh }: { state: HelixState | null; refresh: () => void }) {
   const [busy, setBusy] = useState(false);
-  const [latest, setLatest] = useState<string | null>(null);
+  const [releases, setReleases] = useState<Release[] | null>(null);
+  const [offline, setOffline] = useState(false);
+
+  const loadReleases = useCallback(async () => {
+    const r = await listReleases();
+    setReleases(r.releases);
+    setOffline(r.offline);
+  }, []);
 
   useEffect(() => {
-    checkLatest().then((r) => r.ok && r.tag && setLatest(r.tag));
-  }, []);
+    loadReleases();
+  }, [loadReleases]);
 
   useEffect(() => {
     if (!state?.setup_running) return;
@@ -175,24 +205,59 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
 
   if (!state) return <PanelSection title="HelixSR"><Note>Loading…</Note></PanelSection>;
 
-  const newer = latest && state.version && latest.replace(/^v/, "") !== state.version;
-  const status = !state.downloaded
-    ? "Not downloaded yet"
-    : state.built
-      ? `HelixSR ${state.version}: ready (network built)`
-      : `HelixSR ${state.version}: setup needed (network not built yet)`;
+  const latest = releases?.find((r) => !r.prerelease)?.tag;
+  const local = new Map(state.versions.map((v) => [v.tag, v]));
+  // every release on GitHub, plus downloaded ones GitHub no longer lists (or a hand-extracted one)
+  const tags = [...(releases ?? []).map((r) => r.tag), ...state.versions.map((v) => v.tag)].filter(
+    (t, i, all) => all.indexOf(t) === i,
+  );
+  if (state.active && !tags.includes(state.active)) tags.unshift(state.active);
+  const label = (tag: string) => {
+    const v = local.get(tag);
+    const name = tag === "local" ? `${v?.version ?? "?"} (in ${state.base})` : tag;
+    const parts = [name];
+    if (tag === latest) parts.push("latest");
+    if (releases?.find((r) => r.tag === tag)?.prerelease) parts.push("pre-release");
+    parts.push(v ? (v.built ? "✓ ready" : "setup needed") : "not downloaded");
+    return parts.join(" · ");
+  };
+
+  const tag = state.active;
+  const rel = releases?.find((r) => r.tag === tag);
+  const setupHere = state.setup_running && state.setup_tag === tag;
+
+  const choose = async (t: string) => {
+    await setActive(t);
+    refresh();
+  };
 
   const download = async () => {
+    if (!tag) return;
     setBusy(true);
-    toast(await downloadHelixsr());
+    toast(await downloadRelease(tag));
     setBusy(false);
     refresh();
   };
 
-  const setup = () =>
+  const remove = () =>
+    tag &&
     showModal(
       <ConfirmModal
-        strTitle="Build HelixSR's network"
+        strTitle={`Delete HelixSR ${tag}?`}
+        strDescription={`Removes ${state.dir}, including its built network. Games that have this version installed keep working.`}
+        strOKButtonText="Delete"
+        onOK={async () => {
+          toast(await deleteRelease(tag));
+          refresh();
+        }}
+      />,
+    );
+
+  const setup = () =>
+    tag &&
+    showModal(
+      <ConfirmModal
+        strTitle={`Build HelixSR ${tag}`}
         strDescription={
           "HelixSR's setup downloads NVIDIA's DLSS 310.7.0 DLL from NVIDIA's GitHub (NVIDIA's license applies), " +
           "plus a portable Python with numpy and Microsoft's shader compiler, builds the network into the HelixSR DLL " +
@@ -201,7 +266,7 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
         }
         strOKButtonText="Download and build"
         onOK={async () => {
-          const r = await startSetup();
+          const r = await startSetup(tag);
           if (!r.ok) toast(r);
           refresh();
         }}
@@ -210,15 +275,39 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
 
   return (
     <PanelSection title="HelixSR">
+      <PanelSectionRow>
+        {releases === null && tags.length === 0 ? (
+          <Field label="Loading releases from GitHub…" />
+        ) : (
+          <DropdownItem
+            label="Release to install"
+            rgOptions={tags.map((t) => ({ data: t, label: label(t) }))}
+            selectedOption={tag ?? undefined}
+            strDefaultLabel="Select a release"
+            disabled={state.setup_running}
+            onChange={(o) => choose(o.data)}
+          />
+        )}
+      </PanelSectionRow>
       <Note>
-        <div style={{ color: state.built ? "#5ba32b" : "#e5a50a", fontWeight: 600 }}>{status}</div>
-        <div>{state.dir}</div>
-        {newer && <div style={{ color: "#e5a50a" }}>Newer release available: {latest}</div>}
+        {tag && (
+          <div style={{ color: state.built ? "#5ba32b" : "#e5a50a", fontWeight: 600 }}>
+            {state.built
+              ? `HelixSR ${state.version}: ready to install`
+              : state.downloaded
+                ? `HelixSR ${state.version}: run its setup before installing`
+                : `HelixSR ${tag}: not downloaded yet`}
+          </div>
+        )}
+        {rel?.published_at && <div>Published {new Date(rel.published_at).toLocaleDateString()}</div>}
+        {latest && tag && tag !== latest && <div style={{ color: "#e5a50a" }}>Newer release available: {latest}</div>}
+        {offline && <div>GitHub not reachable: showing the last known releases.</div>}
+        <div>{state.base}</div>
       </Note>
-      {!state.setup_running && (
+      {tag && rel && !state.setup_running && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={download}>
-            {busy ? "Downloading…" : state.downloaded ? `Download latest${latest ? ` (${latest})` : ""} again` : `Download HelixSR${latest ? ` ${latest}` : ""}`}
+            {busy ? "Downloading…" : state.downloaded ? `Download ${tag} again` : `Download ${tag}`}
           </ButtonItem>
         </PanelSectionRow>
       )}
@@ -232,16 +321,31 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
       {state.setup_running && (
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={async () => { await cancelSetup(); refresh(); }}>
-            Cancel setup
+            Cancel setup of {state.setup_tag}
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {(state.setup_running || (state.setup_rc !== null && state.setup_rc !== 0)) && state.setup_log.length > 0 && (
+      {(setupHere || (state.setup_rc !== null && state.setup_rc !== 0 && state.setup_tag === tag)) &&
+        state.setup_log.length > 0 && (
+          <PanelSectionRow>
+            <div style={mono}>
+              {state.setup_running ? "Setup running…\n" : `Setup failed (exit ${state.setup_rc})\n`}
+              {state.setup_log.join("\n")}
+            </div>
+          </PanelSectionRow>
+        )}
+      {state.downloaded && tag !== "local" && !setupHere && (
         <PanelSectionRow>
-          <div style={mono}>
-            {state.setup_running ? "Setup running…\n" : `Setup failed (exit ${state.setup_rc})\n`}
-            {state.setup_log.join("\n")}
-          </div>
+          <ButtonItem layout="below" disabled={busy} onClick={remove}>
+            Delete {tag} from the Deck
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      {!state.setup_running && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={loadReleases}>
+            Check GitHub for releases
+          </ButtonItem>
         </PanelSectionRow>
       )}
       {!state.setup_running && (
@@ -251,7 +355,7 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
             onClick={() =>
               showModal(
                 <FolderModal
-                  initial={state.dir}
+                  initial={state.base}
                   onSave={async (v) => {
                     await setHelixDir(v);
                     refresh();
@@ -317,7 +421,7 @@ function IniControls({ folder, ini, onChange }: { folder: string; ini: IniValues
   );
 }
 
-function DirectSection({ items, ready, reload }: { items: DirectTarget[]; ready: boolean; reload: () => void }) {
+function DirectSection({ items, active, reload }: { items: DirectTarget[]; active: Active; reload: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   if (items.length === 0) return null;
 
@@ -332,13 +436,14 @@ function DirectSection({ items, ready, reload }: { items: DirectTarget[]; ready:
     <PanelSection title="Replace the game's FSR 3.1">
       {items.map((t) => {
         const installed = t.state === "helixsr";
+        const differs = installed && !!active.version && t.helix_version !== active.version;
         return (
           <div key={t.path}>
             <Note>
               <div style={{ fontWeight: 600 }}>{t.rel}</div>
               <div>
                 {t.state === "original" && "Game's FSR DLL"}
-                {installed && `HelixSR ${t.helix_version ?? ""} installed${t.outdated ? " (older than your built version)" : ""}`}
+                {installed && `HelixSR ${t.helix_version ?? ""} installed`}
                 {t.state === "helixsr_no_backup" && "HelixSR without a backup of the game's file"}
                 {t.state === "conflict" && "A backup exists but this file is not HelixSR (game updated?)"}
               </div>
@@ -350,15 +455,15 @@ function DirectSection({ items, ready, reload }: { items: DirectTarget[]; ready:
             </Note>
             {t.state === "original" && (
               <PanelSectionRow>
-                <ButtonItem layout="below" disabled={!ready || busy !== null} onClick={() => run(t.path, () => installDirect(t.path))}>
-                  {ready ? "Install HelixSR here" : "Build HelixSR first"}
+                <ButtonItem layout="below" disabled={!active.ready || busy !== null} onClick={() => run(t.path, () => installDirect(t.path))}>
+                  {active.ready ? `Install HelixSR ${active.version} here` : notReady(active)}
                 </ButtonItem>
               </PanelSectionRow>
             )}
-            {installed && t.outdated && ready && (
+            {differs && active.ready && (
               <PanelSectionRow>
                 <ButtonItem layout="below" disabled={busy !== null} onClick={() => run(t.path, () => installDirect(t.path))}>
-                  Update HelixSR
+                  Switch to HelixSR {active.version}
                 </ButtonItem>
               </PanelSectionRow>
             )}
@@ -382,7 +487,7 @@ function DirectSection({ items, ready, reload }: { items: DirectTarget[]; ready:
   );
 }
 
-function OptiItem({ o, ready, reload }: { o: OptiTarget; ready: boolean; reload: () => void }) {
+function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [keepFsr4, setKeepFsr4] = useState(true);
 
@@ -422,16 +527,20 @@ function OptiItem({ o, ready, reload }: { o: OptiTarget; ready: boolean; reload:
       )}
       {!o.configured ? (
         <PanelSectionRow>
-          <ButtonItem layout="below" disabled={!ready || busy} onClick={() => run(() => installOptiscaler(o.dir, keepFsr4 && !!o.current_sr_dll))}>
-            {ready ? (o.helix_folder_present ? "Point OptiScaler at HelixSR again" : "Use HelixSR in OptiScaler") : "Build HelixSR first"}
+          <ButtonItem layout="below" disabled={!active.ready || busy} onClick={() => run(() => installOptiscaler(o.dir, keepFsr4 && !!o.current_sr_dll))}>
+            {active.ready
+              ? o.helix_folder_present
+                ? `Point OptiScaler at HelixSR ${active.version} again`
+                : `Use HelixSR ${active.version} in OptiScaler`
+              : notReady(active)}
           </ButtonItem>
         </PanelSectionRow>
       ) : (
         <>
-          {ready && (
+          {active.ready && o.helix_version !== active.version && (
             <PanelSectionRow>
               <ButtonItem layout="below" disabled={busy} onClick={() => run(() => installOptiscaler(o.dir, o.kept_fsr4))}>
-                Update HelixSR files
+                Switch to HelixSR {active.version}
               </ButtonItem>
             </PanelSectionRow>
           )}
@@ -474,7 +583,7 @@ function OptiItem({ o, ready, reload }: { o: OptiTarget; ready: boolean; reload:
   );
 }
 
-function GameSection({ appid, ready }: { appid: string; ready: boolean }) {
+function GameSection({ appid, active }: { appid: string; active: Active }) {
   const [game, setGame] = useState<GameDetail | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -502,11 +611,11 @@ function GameSection({ appid, ready }: { appid: string; ready: boolean }) {
           </Note>
         </PanelSection>
       )}
-      <DirectSection items={game.direct} ready={ready} reload={reload} />
+      <DirectSection items={game.direct} active={active} reload={reload} />
       {game.optiscaler.length > 0 && (
         <PanelSection title="OptiScaler">
           {game.optiscaler.map((o) => (
-            <OptiItem key={o.dir} o={o} ready={ready} reload={reload} />
+            <OptiItem key={o.dir} o={o} active={active} reload={reload} />
           ))}
         </PanelSection>
       )}
@@ -606,7 +715,13 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
-      {current && <GameSection key={current.appid} appid={current.appid} ready={!!helix?.built} />}
+      {current && (
+        <GameSection
+          key={current.appid}
+          appid={current.appid}
+          active={{ ready: !!helix?.built, tag: helix?.active ?? null, version: helix?.version ?? null }}
+        />
+      )}
     </>
   );
 }

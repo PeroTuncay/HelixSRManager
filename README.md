@@ -5,9 +5,14 @@ HelixSR README, and checks that it actually runs.
 
 ## What it does
 
-1. **HelixSR**: downloads the latest release to `~/HelixSR` (folder can be changed) and runs its one-time setup
-   (`helixsr-setup.sh --yes`, about 4-5 minutes; downloads NVIDIA's DLSS 310.7.0 DLL after you confirm, builds the
-   network into `amd_fidelityfx_dx12.dll`, deletes NVIDIA's DLL).
+1. **HelixSR release**: a dropdown of every release on
+   [HelixSR's release page](https://github.com/lonewolf0622/HelixSR/releases), read live from GitHub's API (the last
+   list is cached for offline use), so new releases show up without a plugin update. The selected release is the one
+   the install buttons use. Each release is downloaded to its own folder (`~/HelixSR/v1.4.1`, …; the base folder can
+   be changed) and needs its one-time setup (`helixsr-setup.sh --yes`, about 4-5 minutes; downloads NVIDIA's DLSS
+   310.7.0 DLL after you confirm, builds the network, deletes NVIDIA's DLL). Several releases can sit side by side;
+   switching a game to another one is one button. Releases before 1.4.0 keep the network in
+   `helixsr_weights.bin`/`helixsr_kernels.pak`, which are copied along with the DLL.
 2. **Game list**: every installed Steam game from all libraries (SD card too), optionally filtered to games that ship
    an FSR 3.1 DLL or have OptiScaler.
 3. **Replace FSR 3.1 directly**: renames the game's `amd_fidelityfx_upscaler_dx12.dll` (or `amd_fidelityfx_dx12.dll`)

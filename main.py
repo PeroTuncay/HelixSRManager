@@ -32,7 +32,10 @@ SETTINGS_FILE = Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
 RUNTIME_DIR = Path(decky.DECKY_PLUGIN_RUNTIME_DIR)
 SETUP_LOG = Path(decky.DECKY_PLUGIN_LOG_DIR) / "helixsr-setup.log"
 
-RELEASES_API = "https://api.github.com/repos/lonewolf0622/HelixSR/releases/latest"
+RELEASES_API = "https://api.github.com/repos/lonewolf0622/HelixSR/releases?per_page=100"
+RELEASES_CACHE = Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "releases.json"
+LEGACY_TAG = "local"   # a release extracted straight into the base folder (plugin 0.1 layout)
+SEPARATE_FILES = ("helixsr_weights.bin", "helixsr_kernels.pak")   # the network before 1.4.0
 
 NAMES = ("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_dx12.dll")
 INSTALL_MARKER = "helixsr-install.json"        # the official installer's marker, kept compatible
@@ -70,8 +73,57 @@ def save_settings(s):
     SETTINGS_FILE.write_text(json.dumps(s, indent=1))
 
 
-def helix_dir():
+def base_dir():
+    """Parent folder: every downloaded release gets its own subfolder named after its tag (v1.4.1, ...)."""
     return Path(load_settings().get("helix_dir") or HOME / "HelixSR")
+
+
+def valid_tag(tag):
+    return isinstance(tag, str) and (tag == LEGACY_TAG or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,40}", tag))
+
+
+def version_dir(tag):
+    if not valid_tag(tag):
+        raise RuntimeError(f"Invalid release tag: {tag!r}")
+    return base_dir() if tag == LEGACY_TAG else base_dir() / tag
+
+
+def local_versions():
+    """Downloaded releases: [{tag, dir, version, built, setup_script}], newest first."""
+    out = []
+    candidates = [(LEGACY_TAG, base_dir())]
+    try:
+        candidates += [(d.name, d) for d in base_dir().iterdir() if d.is_dir() and valid_tag(d.name)]
+    except OSError:
+        pass
+    for tag, d in candidates:
+        dll = d / "amd_fidelityfx_dx12.dll"
+        if dll.exists() and is_helixsr(dll):
+            out.append({"tag": tag, "dir": str(d), "version": helix_version(dll), "built": has_network(dll),
+                        "setup_script": (d / "helixsr-setup.sh").exists()})
+    out.sort(key=lambda v: version_key(v["version"] or v["tag"]), reverse=True)
+    return out
+
+
+def version_key(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4])
+
+
+def active_tag():
+    """The release games get. Chosen in the UI; defaults to the newest built (else newest downloaded) release."""
+    tag = load_settings().get("active")
+    if tag and valid_tag(tag):
+        return tag
+    local = local_versions()
+    built = [v for v in local if v["built"]]
+    return (built or local or [{"tag": None}])[0]["tag"]
+
+
+def active_dir():
+    tag = active_tag()
+    if not tag:
+        raise RuntimeError("No HelixSR release selected. Pick one and download it first.")
+    return version_dir(tag)
 
 
 def clean_env():
@@ -108,15 +160,9 @@ def helix_version(path):
 
 def has_network(path):
     """True when the setup appended the network to the DLL (or left it as separate files next to it)."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(-32, os.SEEK_END)
-            if f.read(8) == EMBED_MAGIC:
-                return True
-    except OSError:
-        return False
-    p = Path(path).parent
-    return (p / "helixsr_weights.bin").exists() and (p / "helixsr_kernels.pak").exists()
+    if has_embedded_network(path):
+        return True
+    return all((Path(path).parent / n).exists() for n in SEPARATE_FILES)
 
 
 def original_of(target):
@@ -310,22 +356,45 @@ def near_optiscaler(target, opti_dirs):
 # --- the HelixSR download and setup -----------------------------------------------------------------------------------
 
 def helix_state():
-    d = helix_dir()
-    dll = d / "amd_fidelityfx_dx12.dll"
-    state = {"dir": str(d), "downloaded": dll.exists() and is_helixsr(dll), "version": helix_version(dll),
-             "built": False, "setup_script": (d / "helixsr-setup.sh").exists()}
-    if state["downloaded"]:
-        state["built"] = has_network(dll)
-    return state
+    tag = active_tag()
+    local = local_versions()
+    cur = next((v for v in local if v["tag"] == tag), None)
+    return {"base": str(base_dir()), "active": tag, "versions": local,
+            "dir": cur["dir"] if cur else (str(version_dir(tag)) if tag else None),
+            "downloaded": cur is not None, "version": cur["version"] if cur else None,
+            "built": bool(cur and cur["built"]), "setup_script": bool(cur and cur["setup_script"])}
 
 
 def built_dll():
-    dll = helix_dir() / "amd_fidelityfx_dx12.dll"
+    d = active_dir()
+    dll = d / "amd_fidelityfx_dx12.dll"
     if not dll.exists() or not is_helixsr(dll):
-        raise RuntimeError(f"No HelixSR DLL in {helix_dir()}. Download HelixSR first.")
+        raise RuntimeError(f"HelixSR {active_tag()} isn't downloaded yet ({d}).")
     if not has_network(dll):
-        raise RuntimeError("The HelixSR DLL has no network yet. Run the setup first (otherwise games show a red frame).")
+        raise RuntimeError(f"HelixSR {active_tag()} has no network yet. Run its setup first "
+                           f"(otherwise games show a red frame).")
     return dll
+
+
+def copy_helix(dll, dest):
+    """Copies HelixSR's DLL to dest. Releases before 1.4.0 keep the network in two files next to the DLL: those go
+    along; for a release with the network inside the DLL, stale copies of them are removed."""
+    shutil.copyfile(dll, dest)
+    for name in SEPARATE_FILES:
+        src, dst = dll.parent / name, dest.parent / name
+        if src.exists() and not has_embedded_network(dll):
+            shutil.copyfile(src, dst)
+        elif dst.exists():
+            dst.unlink()
+
+
+def has_embedded_network(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(-32, os.SEEK_END)
+            return f.read(8) == EMBED_MAGIC
+    except OSError:
+        return False
 
 
 def run_curl(args, timeout=300):
@@ -336,13 +405,28 @@ def run_curl(args, timeout=300):
     return p.stdout
 
 
-def latest_release():
-    info = json.loads(run_curl(["-H", "Accept: application/vnd.github+json", RELEASES_API], timeout=30))
-    asset = next((a for a in info.get("assets", []) if a["name"].lower().endswith(".zip")), None)
-    if not asset:
-        raise RuntimeError("The latest HelixSR release has no zip file.")
-    return {"tag": info.get("tag_name"), "name": asset["name"], "url": asset["browser_download_url"],
-            "size": asset.get("size")}
+def fetch_releases():
+    """Every published HelixSR release with a zip, newest first, from GitHub's release API (cached for offline use)."""
+    data = json.loads(run_curl(["-H", "Accept: application/vnd.github+json", RELEASES_API], timeout=30))
+    out = []
+    for r in data:
+        asset = next((a for a in r.get("assets", []) if a["name"].lower().endswith(".zip")), None)
+        if r.get("draft") or not asset or not valid_tag(r.get("tag_name")):
+            continue
+        out.append({"tag": r["tag_name"], "name": asset["name"], "url": asset["browser_download_url"],
+                    "size": asset.get("size"), "published_at": r.get("published_at"),
+                    "prerelease": bool(r.get("prerelease"))})
+    out.sort(key=lambda r: r["published_at"] or "", reverse=True)
+    RELEASES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    RELEASES_CACHE.write_text(json.dumps(out, indent=1))
+    return out
+
+
+def cached_releases():
+    try:
+        return json.loads(RELEASES_CACHE.read_text())
+    except (OSError, ValueError):
+        return []
 
 
 def extract_release(zip_path, target):
@@ -494,7 +578,7 @@ def install_direct(target, dll, ini_src):
     if is_helixsr(target):
         if not orig.exists():
             raise RuntimeError(f"{target.name} is HelixSR but the game's file is missing ({orig.name}); left as it is.")
-        shutil.copyfile(dll, target)   # update
+        copy_helix(dll, target)   # update or switch to another release
         msg = f"Updated HelixSR in {target.parent.name}"
     else:
         if orig.exists():
@@ -502,7 +586,7 @@ def install_direct(target, dll, ini_src):
                                f"Left as it is.")
         os.replace(target, orig)
         try:
-            shutil.copyfile(dll, target)
+            copy_helix(dll, target)
         except OSError:
             os.replace(orig, target)
             raise
@@ -523,7 +607,7 @@ def uninstall_direct(target, ini_src):
     if target.exists():
         target.unlink()
     os.replace(orig, target)
-    for extra in (INSTALL_MARKER, "helixsr.log"):
+    for extra in (INSTALL_MARKER, "helixsr.log", *SEPARATE_FILES):
         p = target.parent / extra
         if p.exists():
             p.unlink()
@@ -547,8 +631,8 @@ def install_optiscaler(opti_dir, dll, ini_src, keep_fsr4):
         raise RuntimeError(f"{sub} exists but wasn't made by this plugin; rename or remove it first.")
     sub.mkdir(exist_ok=True)
 
-    shutil.copyfile(dll, sub / NAMES[1])
-    shutil.copyfile(dll, sub / NAMES[0])
+    copy_helix(dll, sub / NAMES[1])
+    copy_helix(dll, sub / NAMES[0])
     # frame generation: HelixSR forwards non-upscaling effects to amd_fidelityfx_dx12.original.dll next to it
     if cur_ffx and not is_helixsr(cur_ffx) and not (sub / "amd_fidelityfx_dx12.original.dll").exists():
         shutil.copyfile(cur_ffx, sub / "amd_fidelityfx_dx12.original.dll")
@@ -609,6 +693,7 @@ class Plugin:
     setup_proc = None
     setup_rc = None
     setup_started = None
+    setup_tag = None
     games_cache = {}
 
     async def _main(self):
@@ -622,6 +707,7 @@ class Plugin:
     async def get_helix_state(self):
         s = helix_state()
         s["setup_running"] = self.setup_proc is not None and self.setup_proc.returncode is None
+        s["setup_tag"] = self.setup_tag
         s["setup_rc"] = self.setup_rc
         s["setup_log"] = tail_lines(SETUP_LOG, 12) if SETUP_LOG.exists() else []
         return s
@@ -630,55 +716,88 @@ class Plugin:
         p = Path(os.path.expanduser(path.strip())) if path.strip() else HOME / "HelixSR"
         s = load_settings()
         s["helix_dir"] = str(p)
+        s.pop("active", None)
         save_settings(s)
         return await self.get_helix_state()
 
-    async def check_latest(self):
+    async def list_releases(self):
+        """Releases from GitHub; on failure the last list fetched, flagged offline."""
         try:
-            return {"ok": True, **(await asyncio.to_thread(latest_release))}
+            return {"ok": True, "offline": False, "releases": await asyncio.to_thread(fetch_releases)}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": True, "offline": True, "error": str(e), "releases": cached_releases()}
 
-    async def download_helixsr(self):
+    async def set_active(self, tag):
+        if not valid_tag(tag):
+            return {"ok": False, "error": "Invalid release."}
+        s = load_settings()
+        s["active"] = tag
+        save_settings(s)
+        return {"ok": True}
+
+    async def download_release(self, tag):
         try:
             def work():
-                rel = latest_release()
+                rel = next((r for r in cached_releases() if r["tag"] == tag), None) or \
+                    next((r for r in fetch_releases() if r["tag"] == tag), None)
+                if not rel:
+                    raise RuntimeError(f"Release {tag} not found on GitHub.")
+                d = version_dir(tag)
                 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
                 zp = RUNTIME_DIR / rel["name"]
                 run_curl(["-o", str(zp), rel["url"]], timeout=600)
-                extract_release(zp, helix_dir())
+                if d.exists() and d != base_dir():
+                    shutil.rmtree(d)   # a clean folder per release (a re-download means a fresh setup anyway)
+                extract_release(zp, d)
                 zp.unlink()
-                return rel["tag"]
-            tag = await asyncio.to_thread(work)
-            return {"ok": True, "message": f"HelixSR {tag} downloaded to {helix_dir()}. Now run the setup."}
+                return d
+            d = await asyncio.to_thread(work)
+            return {"ok": True, "message": f"HelixSR {tag} downloaded to {d}. Now run its setup."}
         except Exception as e:
             decky.logger.exception("download")
             return {"ok": False, "error": str(e)}
 
-    async def start_setup(self):
+    async def delete_release(self, tag):
+        try:
+            d = version_dir(tag)
+            if self.setup_proc is not None and self.setup_proc.returncode is None and self.setup_tag == tag:
+                raise RuntimeError("Its setup is running.")
+            if tag == LEGACY_TAG or not d.is_dir() or base_dir().resolve() not in d.resolve().parents:
+                raise RuntimeError("Only release folders this plugin downloaded can be deleted here.")
+            await asyncio.to_thread(shutil.rmtree, d)
+            return {"ok": True, "message": f"Deleted HelixSR {tag}. Games that have it installed keep working."}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def start_setup(self, tag):
         if self.setup_proc is not None and self.setup_proc.returncode is None:
-            return {"ok": False, "error": "The setup is already running."}
-        script = helix_dir() / "helixsr-setup.sh"
+            return {"ok": False, "error": "A setup is already running."}
+        try:
+            d = version_dir(tag)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        script = d / "helixsr-setup.sh"
         if not script.exists():
-            return {"ok": False, "error": "helixsr-setup.sh not found. Download HelixSR first."}
+            return {"ok": False, "error": f"helixsr-setup.sh not found. Download HelixSR {tag} first."}
         SETUP_LOG.parent.mkdir(parents=True, exist_ok=True)
         log = open(SETUP_LOG, "wb")
         log.write(f"[decky] {time.ctime()}: running {script} --yes\n".encode())
         log.flush()
         # --yes: the user agreed to NVIDIA's DLSS download in the confirmation dialog
         self.setup_proc = await asyncio.create_subprocess_exec(
-            "bash", str(script), str(helix_dir()), "--yes", cwd=str(helix_dir()), env=clean_env(),
+            "bash", str(script), str(d), "--yes", cwd=str(d), env=clean_env(),
             stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         log.close()
+        self.setup_tag = tag
         self.setup_rc = None
         self.setup_started = time.time()
-        asyncio.get_event_loop().create_task(self._wait_setup(self.setup_proc))
+        asyncio.get_event_loop().create_task(self._wait_setup(self.setup_proc, d))
         return {"ok": True}
 
-    async def _wait_setup(self, proc):
+    async def _wait_setup(self, proc, d):
         rc = await proc.wait()
         self.setup_rc = rc
-        ok = rc == 0 and helix_state()["built"]
+        ok = rc == 0 and has_network(d / "amd_fidelityfx_dx12.dll")
         await decky.emit("setup_done", ok)
 
     async def cancel_setup(self):
@@ -719,7 +838,6 @@ class Plugin:
                 g = self._game(appid)
                 folder = Path(g["path"])
                 dlls, opti = scan_folder(folder)
-                built = helix_state()
                 direct = []
                 for t in direct_targets(dlls):
                     orig = original_of(t)
@@ -729,7 +847,6 @@ class Plugin:
                     v = helix_version(t) if helix else None
                     direct.append({
                         "path": str(t), "rel": os.path.relpath(t, folder), "state": state, "helix_version": v,
-                        "outdated": bool(helix and built["version"] and v != built["version"]),
                         "near_optiscaler": near_optiscaler(t, opti), "size": t.stat().st_size,
                         "check": helix_log_check(t.parent), "ini": helix_ini_values(t.parent),
                     })
@@ -769,14 +886,14 @@ class Plugin:
 
     async def install_direct(self, path):
         return await self._do(lambda: install_direct(self._checked_target(path), built_dll(),
-                                                     helix_dir() / "helixsr.ini"))
+                                                     active_dir() / "helixsr.ini"))
 
     async def uninstall_direct(self, path):
-        return await self._do(lambda: uninstall_direct(self._checked_target(path), helix_dir() / "helixsr.ini"))
+        return await self._do(lambda: uninstall_direct(self._checked_target(path), active_dir() / "helixsr.ini"))
 
     async def install_optiscaler(self, path, keep_fsr4):
         return await self._do(lambda: install_optiscaler(self._checked_opti(path), built_dll(),
-                                                         helix_dir() / "helixsr.ini", bool(keep_fsr4)))
+                                                         active_dir() / "helixsr.ini", bool(keep_fsr4)))
 
     async def uninstall_optiscaler(self, path):
         return await self._do(lambda: uninstall_optiscaler(self._checked_opti(path)))
@@ -796,7 +913,7 @@ class Plugin:
                 raise RuntimeError("No HelixSR install in that folder.")
             ini = f / "helixsr.ini"
             if not ini.exists():
-                src = helix_dir() / "helixsr.ini"
+                src = active_dir() / "helixsr.ini"
                 if src.exists():
                     shutil.copyfile(src, ini)
                 else:
