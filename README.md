@@ -50,3 +50,8 @@ npm run package     # -> out/HelixSR-Manager.zip
   picks up the built DLL afterwards.
 - Direct3D 12 only. Vulkan games aren't supported by HelixSR.
 - Close the game before installing or reverting.
+
+## License
+
+Public domain ([The Unlicense](LICENSE)): copy, change and use it however you like. The install logic follows
+HelixSR's Apache-2.0 installer script; see [LICENSE](LICENSE) for the notes on HelixSR and NVIDIA's files.

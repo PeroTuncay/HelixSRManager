@@ -10,7 +10,7 @@
   },
   "keywords": ["decky", "plugin", "steam-deck", "helixsr", "optiscaler", "fsr"],
   "author": "PeroTuncay",
-  "license": "BSD-3-Clause",
+  "license": "Unlicense",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",
