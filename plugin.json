@@ -1,0 +1,11 @@
+{
+  "name": "HelixSR Manager",
+  "author": "PeroTuncay",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["upscaling", "fsr", "optiscaler"],
+    "description": "Install HelixSR into Steam games in place of FSR 3.1, directly or through OptiScaler, and check that it runs.",
+    "image": "https://opengraph.githubassets.com/1/lonewolf0622/HelixSR"
+  }
+}
