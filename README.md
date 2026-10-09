@@ -3,13 +3,57 @@
 Installs [HelixSR](https://github.com/lonewolf0622/HelixSR) into Steam games on the Steam Deck, following the
 HelixSR README, and checks that it actually runs.
 
+Tested on a Steam Deck OLED with The Witcher 3 (DirectX 12) through OptiScaler.
+
+## Installation
+
+### 1. Install the plugin
+
+1. In Decky Loader, open **Settings → General** and turn on **Developer mode**.
+2. Open **Settings → Developer → Install plugin from URL** and paste the link to `HelixSR-Manager.zip` from the
+   [latest release](https://github.com/PeroTuncay/HelixSRManager/releases/latest) (on the release page: right-click
+   or long-press the zip → copy link).
+   Alternatively, download the zip, copy it to the Deck and use **Install plugin from ZIP file**.
+3. Open the Quick Access menu (`···` button) → Decky → **HelixSR Manager**.
+
+Updating works the same way: install the newer zip over the old one.
+
+### 2. Download and build HelixSR (once per release)
+
+1. Under **HelixSR**, pick a release in **Release to install** (the newest is marked *latest*).
+2. Press **Download**.
+3. Press **Run setup (build network)** and confirm. The setup downloads NVIDIA's DLSS 310.7.0 DLL, a portable Python
+   with numpy and Microsoft's shader compiler, builds HelixSR's network into the DLL and deletes NVIDIA's DLL again.
+4. Wait for it to finish: **about 7-10 minutes on a Steam Deck OLED** (the first run includes the one-time downloads;
+   later releases reuse Python and the compiler). Keep the Deck plugged in and don't let it sleep, since sleep pauses
+   the setup. You can close the menu meanwhile; the progress bar picks up where it is when you reopen it.
+5. The release now shows **✓ ready**.
+
+### 3. Install HelixSR into a game
+
+Close the game first, then pick it under **Game** (the list shows games with an FSR 3.1 DLL or OptiScaler; turn off the
+filter to see all).
+
+- **Game with OptiScaler** (e.g. FSR 4 via OptiScaler, or DLSS/XeSS games): in the **OptiScaler** section press
+  **Use HelixSR in OptiScaler**. Leave **Keep current FSR selectable** on to keep your FSR 4 available for
+  comparison. In the game, open OptiScaler's menu and pick **FSR HelixSR (3.1.5)** under Upscalers → FFX Upscaler.
+- **Game that ships FSR 3.1 itself**: in **Replace the game's FSR 3.1** press **Install HelixSR here**, then select
+  AMD FSR as the upscaler in the game's settings.
+
+### 4. Check that it runs
+
+After playing for a moment, press **Check again** in the plugin. Green **HelixSR network running** means it works. A
+red frame around the picture, or a red status, means the network isn't running; the plugin shows what HelixSR logged.
+
+To undo: **Revert OptiScaler to previous upscaler** or **Restore the game's FSR**.
+
 ## What it does
 
 1. **HelixSR release**: a dropdown of every release on
    [HelixSR's release page](https://github.com/lonewolf0622/HelixSR/releases), read live from GitHub's API (the last
    list is cached for offline use), so new releases show up without a plugin update. The selected release is the one
    the install buttons use. Each release is downloaded to its own folder (`~/HelixSR/v1.4.1`, …; the base folder can
-   be changed) and needs its one-time setup (`helixsr-setup.sh --yes`, about 4-5 minutes; downloads NVIDIA's DLSS
+   be changed) and needs its one-time setup (`helixsr-setup.sh --yes`, about 7-10 minutes on a Steam Deck OLED; downloads NVIDIA's DLSS
    310.7.0 DLL after you confirm, builds the network, deletes NVIDIA's DLL). Several releases can sit side by side;
    switching a game to another one is one button. Releases before 1.4.0 keep the network in
    `helixsr_weights.bin`/`helixsr_kernels.pak`, which are copied along with the DLL.
@@ -39,12 +83,6 @@ HelixSR README, and checks that it actually runs.
    if enabled, OptiScaler.log lines about HelixSR/FFX.
 8. **Settings**: `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per install.
 
-## Install on the Deck
-
-Decky Loader → Settings → General → enable **Developer mode**, then Developer → **Install plugin from ZIP file** and
-pick `HelixSR-Manager.zip` (copy it to the Deck first, e.g. to `~/Downloads`). Or serve the zip over the network and
-use **Install plugin from URL**.
-
 ## Build
 
 ```
@@ -55,10 +93,10 @@ npm run package     # -> out/HelixSR-Manager.zip
 ## Notes
 
 - Runs as the `deck` user (no root).
-- Don't let the Deck sleep during the setup (sleep pauses it). Expect it to take longer than the 4-5 minutes HelixSR
-  quotes for a desktop CPU.
-- If the setup fails in Gaming Mode, run `~/HelixSR/helixsr-setup.sh` once from Konsole in Desktop Mode; the plugin
-  picks up the built DLL afterwards.
+- Setup time: about 7-10 minutes on a Steam Deck OLED (HelixSR quotes 4-5 minutes for a desktop CPU). Don't let the
+  Deck sleep during the setup (sleep pauses it).
+- If the setup fails in Gaming Mode, run it once from Konsole in Desktop Mode, e.g.
+  `~/HelixSR/v1.4.1/helixsr-setup.sh`; the plugin picks up the built DLL afterwards.
 - Direct3D 12 only. Vulkan games aren't supported by HelixSR.
 - Close the game before installing or reverting.
 
