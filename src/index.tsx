@@ -22,7 +22,16 @@ import { FaDna } from "react-icons/fa";
 
 type Result = { ok: boolean; message?: string; error?: string };
 
-type LocalVersion = { tag: string; dir: string; version: string | null; built: boolean; setup_script: boolean };
+type ReleaseKind = "ffx" | "ngx"; // up to 1.4: FSR 3.1 replacement; 1.5+: DLSS (NGX) replacement via OptiScaler
+
+type LocalVersion = {
+  tag: string;
+  dir: string;
+  version: string | null;
+  kind: ReleaseKind;
+  built: boolean;
+  setup_script: boolean;
+};
 
 type Release = {
   tag: string;
@@ -43,6 +52,7 @@ type HelixState = {
   built: boolean;
   setup_script: boolean;
   setup: SetupStatus;
+  kind: ReleaseKind | null;
 };
 
 type SetupStatus = {
@@ -98,6 +108,8 @@ type OptiTarget = {
   dir: string;
   rel: string;
   configured: boolean;
+  installed_kind: ReleaseKind | null;
+  nvngx_path: string;
   helix_folder_present: boolean;
   helix_version: string | null;
   dx12_upscaler: string;
@@ -108,12 +120,19 @@ type OptiTarget = {
   kept_fsr4: boolean;
   log_to_file: boolean;
   check: Check;
-  opti_log: { exists: boolean; path: string; mtime?: number; lines: string[] };
+  opti_log: { exists: boolean; path: string; mtime?: number; lines: string[]; not_nvidia: boolean };
   ini: IniValues;
   helix_folder: string;
 };
 
-type Active = { ready: boolean; tag: string | null; version: string | null };
+type Active = { ready: boolean; tag: string | null; version: string | null; kind: ReleaseKind | null };
+
+// 1.5.0 is where HelixSR became an NGX core; before a release is downloaded, its tag is all there is to go by
+function isNgxRelease(tag: string | null, local?: LocalVersion) {
+  if (local) return local.kind === "ngx";
+  const m = (tag ?? "").match(/(\d+)\.(\d+)/);
+  return !!m && (Number(m[1]) > 1 || (Number(m[1]) === 1 && Number(m[2]) >= 5));
+}
 
 type GameSummary = { appid: string; name: string; path: string; fsr: boolean; optiscaler: boolean; helixsr: boolean };
 type GameDetail = Result & {
@@ -492,6 +511,7 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
     const parts = [name];
     if (tag === latest) parts.push("latest");
     if (releases?.find((r) => r.tag === tag)?.prerelease) parts.push("pre-release");
+    if (isNgxRelease(tag, v)) parts.push("DLSS via OptiScaler");
     parts.push(v ? (v.built ? "✓ ready" : "setup needed") : "not downloaded");
     return parts.join(" · ");
   };
@@ -575,6 +595,12 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
           </div>
         )}
         {rel?.published_at && <div>Published {new Date(rel.published_at).toLocaleDateString()}</div>}
+        {tag && isNgxRelease(tag, local.get(tag)) && (
+          <div>
+            Since 1.5, HelixSR runs as DLSS and only through OptiScaler (0.9.4). It needs a Steam launch option, which
+            the plugin can set per game. To replace a game's own FSR 3.1 directly, pick a 1.4 release.
+          </div>
+        )}
         {latest && tag && tag !== latest && <div style={{ color: "#e5a50a" }}>Newer release available: {latest}</div>}
         {offline && <div>GitHub not reachable: showing the last known releases.</div>}
         <div>{state.base}</div>
@@ -676,7 +702,17 @@ function CheckBlock({ check, ini }: { check: Check; ini: IniValues }) {
   );
 }
 
-function IniControls({ folder, ini, onChange }: { folder: string; ini: IniValues; onChange: () => void }) {
+function IniControls({
+  folder,
+  ini,
+  kind,
+  onChange,
+}: {
+  folder: string;
+  ini: IniValues;
+  kind: ReleaseKind;
+  onChange: () => void;
+}) {
   const save = async (option: string, value: string) => {
     toast(await setHelixOption(folder, option, value));
     onChange();
@@ -686,11 +722,17 @@ function IniControls({ folder, ini, onChange }: { folder: string; ini: IniValues
       <PanelSectionRow>
         <ToggleField
           label="DLSS network (Model E)"
-          description="Turn off to prove HelixSR is upscaling: it then falls back to a simple, blurry upscale. Takes effect after restarting the game; for live comparisons switch upscalers in OptiScaler's menu."
+          description={
+            kind === "ngx"
+              ? "Experimental for 1.5+: HelixSR 1.5 documents no settings but still contains this helixsr.ini switch. Turn off and restart the game; if the picture turns blurry, HelixSR is upscaling. If nothing changes, the switch may simply not apply in 1.5."
+              : "Turn off to prove HelixSR is upscaling: it then falls back to a simple, blurry upscale. Takes effect after restarting the game; for live comparisons switch upscalers in OptiScaler's menu."
+          }
           checked={ini.model_e_enabled}
           onChange={(on) => save("model_e", on ? "true" : "false")}
         />
       </PanelSectionRow>
+      {kind === "ffx" && (
+        <>
       <PanelSectionRow>
         <DropdownItem
           label="Network resolution"
@@ -708,6 +750,8 @@ function IniControls({ folder, ini, onChange }: { folder: string; ini: IniValues
           onChange={(o) => save("sharpening", o.data)}
         />
       </PanelSectionRow>
+        </>
+      )}
     </>
   );
 }
@@ -744,14 +788,20 @@ function DirectSection({ items, active, reload }: { items: DirectTarget[]; activ
                 </div>
               )}
             </Note>
-            {t.state === "original" && (
+            {t.state === "original" && active.kind === "ngx" && (
+              <Note>
+                HelixSR {active.version} only works through OptiScaler (as DLSS). Pick a 1.4 release to replace this
+                DLL directly.
+              </Note>
+            )}
+            {t.state === "original" && active.kind !== "ngx" && (
               <PanelSectionRow>
                 <ButtonItem layout="below" disabled={!active.ready || busy !== null} onClick={() => run(t.path, () => installDirect(t.path))}>
                   {active.ready ? `Install HelixSR ${active.version} here` : notReady(active)}
                 </ButtonItem>
               </PanelSectionRow>
             )}
-            {differs && active.ready && (
+            {differs && active.ready && active.kind !== "ngx" && (
               <PanelSectionRow>
                 <ButtonItem layout="below" disabled={busy !== null} onClick={() => run(t.path, () => installDirect(t.path))}>
                   Switch to HelixSR {active.version}
@@ -768,7 +818,7 @@ function DirectSection({ items, active, reload }: { items: DirectTarget[]; activ
             {installed && (
               <>
                 <CheckBlock check={t.check} ini={t.ini} />
-                <IniControls folder={t.path.replace(/\/[^/]+$/, "")} ini={t.ini} onChange={reload} />
+                <IniControls folder={t.path.replace(/\/[^/]+$/, "")} ini={t.ini} kind="ffx" onChange={reload} />
               </>
             )}
           </div>
@@ -778,7 +828,127 @@ function DirectSection({ items, active, reload }: { items: DirectTarget[]; activ
   );
 }
 
-function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload: () => void }) {
+// --- Steam launch options (HelixSR 1.5+ needs the GPU to look like an NVIDIA one) --------------------------------------
+
+const NGX_LAUNCH_VARS = "PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100";
+
+function readLaunchOptions(appId: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    let reg: { unregister(): void } | null = null;
+    const finish = (value: string | null) => {
+      if (done) return;
+      done = true;
+      setTimeout(() => reg?.unregister(), 0); // the callback can fire before RegisterForAppDetails returns
+      resolve(value);
+    };
+    try {
+      reg = SteamClient.Apps.RegisterForAppDetails(appId, (d) => finish(d?.strLaunchOptions ?? ""));
+    } catch {
+      finish(null);
+    }
+    setTimeout(() => finish(null), 3000);
+  });
+}
+
+const hasNgxVars = (o: string) => /\bPROTON_FORCE_NVAPI=1\b/.test(o) && /\bDXVK_NVAPI_GPU_ARCH=\S+/.test(o);
+const stripNgxVars = (o: string) =>
+  o.replace(/\bPROTON_FORCE_NVAPI=\S*\s*/g, "").replace(/\bDXVK_NVAPI_GPU_ARCH=\S*\s*/g, "").trim();
+
+// The variables go first; whatever was there (e.g. Decky Framegen's "~/fgmod/fgmod %command%") stays after them.
+function withNgxVars(o: string) {
+  const rest = stripNgxVars(o);
+  if (!rest) return `${NGX_LAUNCH_VARS} %command%`;
+  return `${NGX_LAUNCH_VARS} ${rest.includes("%command%") ? rest : `%command% ${rest}`}`;
+}
+
+function withoutNgxVars(o: string) {
+  const rest = stripNgxVars(o);
+  if (rest === "%command%") return "";
+  // "%command% -dx12" means the same to Steam as "-dx12", the form a game with only arguments had before
+  return rest.startsWith("%command% ") && !rest.slice(10).includes("%command%") ? rest.slice(10) : rest;
+}
+
+function LaunchOptionControl({ appid, needed }: { appid: string; needed: boolean }) {
+  const id = Number(appid);
+  const [opts, setOpts] = useState<string | null | undefined>(undefined);
+  const load = useCallback(() => {
+    readLaunchOptions(id).then(setOpts);
+  }, [id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const apply = (value: string) => {
+    try {
+      SteamClient.Apps.SetAppLaunchOptions(id, value);
+      toaster.toast({ title: "Launch options", body: value ? `Set to: ${value}` : "Cleared" });
+    } catch (e) {
+      toaster.toast({ title: "Launch options", body: `Couldn't set them: ${e}` });
+    }
+    setTimeout(load, 500);
+  };
+
+  if (opts === undefined) return needed ? <Note>Reading the game's launch options…</Note> : null;
+  if (opts === null) {
+    return needed ? (
+      <Note>
+        <span style={{ color: "#e5a50a" }}>
+          Couldn't read this game's launch options. Add them in Steam (game → Properties → Launch Options):
+        </span>
+        <div style={mono}>{NGX_LAUNCH_VARS} %command%</div>
+      </Note>
+    ) : null;
+  }
+  const has = hasNgxVars(opts);
+  if (!needed && !has) return null;
+  return (
+    <>
+      <Note>
+        {needed ? (
+          has ? (
+            <span style={{ color: "#5ba32b", fontWeight: 600 }}>✓ Launch option set (GPU shows up as NVIDIA for DLSS)</span>
+          ) : (
+            <span style={{ color: "#e5a50a", fontWeight: 600 }}>
+              Launch option missing: without it OptiScaler doesn't offer DLSS, so HelixSR never runs.
+            </span>
+          )
+        ) : (
+          <span style={{ color: "#e5a50a" }}>
+            The launch option for HelixSR 1.5+ is still set. It isn't needed without HelixSR 1.5+.
+          </span>
+        )}
+        <div style={mono}>{opts || "(no launch options)"}</div>
+      </Note>
+      {needed && !has && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => apply(withNgxVars(opts))}>
+            Add launch option
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      {(!needed || has) && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => apply(withoutNgxVars(opts))}>
+            Remove HelixSR launch option
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+    </>
+  );
+}
+
+function OptiItem({
+  o,
+  active,
+  appid,
+  reload,
+}: {
+  o: OptiTarget;
+  active: Active;
+  appid: string;
+  reload: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [keepFsr4, setKeepFsr4] = useState(true);
 
@@ -789,6 +959,9 @@ function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload
     reload();
   };
 
+  const ngxActive = active.kind === "ngx";
+  const installed = o.installed_kind;
+  const differs = installed !== null && !!active.version && o.helix_version !== active.version;
   const sizeMb = o.current_sr_dll ? (o.current_sr_dll.size / 1048576).toFixed(1) : null;
 
   return (
@@ -797,16 +970,26 @@ function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload
         <div style={{ fontWeight: 600 }}>{o.rel === "." ? "Game folder" : o.rel}</div>
         <div>
           {o.configured
-            ? `Uses HelixSR ${o.helix_version ?? ""}${o.kept_fsr4 ? " (FSR 4 selectable next to it)" : ""}`
-            : o.helix_folder_present
+            ? installed === "ngx"
+              ? `Uses HelixSR ${o.helix_version ?? ""} as DLSS`
+              : `Uses HelixSR ${o.helix_version ?? ""}${o.kept_fsr4 ? " (FSR 4 selectable next to it)" : ""}`
+            : installed
               ? "HelixSR folder present, but OptiScaler.ini no longer points to it (OptiScaler reinstalled?)"
-              : `Dx12Upscaler=${o.dx12_upscaler}, FfxDx12SRPath=${o.ffx_sr_path}`}
+              : ngxActive
+                ? `Dx12Upscaler=${o.dx12_upscaler}, NvngxPath=${o.nvngx_path}`
+                : `Dx12Upscaler=${o.dx12_upscaler}, FfxDx12SRPath=${o.ffx_sr_path}`}
         </div>
         {!o.configured && o.current_sr_dll && (
           <div>Current FSR upscaler DLL: {o.current_sr_dll.path.split("/").slice(-2).join("/")} ({sizeMb} MB)</div>
         )}
+        {ngxActive && !o.configured && (
+          <div>
+            HelixSR {active.version} runs as DLSS through OptiScaler (0.9.4 needed). Your FSR setup stays selectable
+            in OptiScaler's menu.
+          </div>
+        )}
       </Note>
-      {!o.configured && o.current_sr_dll && (
+      {!ngxActive && !o.configured && o.current_sr_dll && (
         <PanelSectionRow>
           <ToggleField
             label="Keep current FSR selectable"
@@ -818,38 +1001,52 @@ function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload
       )}
       {!o.configured ? (
         <PanelSectionRow>
-          <ButtonItem layout="below" disabled={!active.ready || busy} onClick={() => run(() => installOptiscaler(o.dir, keepFsr4 && !!o.current_sr_dll))}>
+          <ButtonItem
+            layout="below"
+            disabled={!active.ready || busy}
+            onClick={() => run(() => installOptiscaler(o.dir, keepFsr4 && !!o.current_sr_dll))}
+          >
             {active.ready
-              ? o.helix_folder_present
+              ? installed
                 ? `Point OptiScaler at HelixSR ${active.version} again`
-                : `Use HelixSR ${active.version} in OptiScaler`
+                : `Use HelixSR ${active.version} in OptiScaler${ngxActive ? " (as DLSS)" : ""}`
               : notReady(active)}
           </ButtonItem>
         </PanelSectionRow>
       ) : (
-        <>
-          {active.ready && o.helix_version !== active.version && (
-            <PanelSectionRow>
-              <ButtonItem layout="below" disabled={busy} onClick={() => run(() => installOptiscaler(o.dir, o.kept_fsr4))}>
-                Switch to HelixSR {active.version}
-              </ButtonItem>
-            </PanelSectionRow>
-          )}
-        </>
+        active.ready &&
+        differs && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={busy} onClick={() => run(() => installOptiscaler(o.dir, o.kept_fsr4))}>
+              Switch to HelixSR {active.version}
+              {ngxActive && installed === "ffx" ? " (as DLSS)" : ""}
+            </ButtonItem>
+          </PanelSectionRow>
+        )
       )}
-      {o.helix_folder_present && (
+      {installed && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={() => run(() => uninstallOptiscaler(o.dir))}>
             Revert OptiScaler to previous upscaler
           </ButtonItem>
         </PanelSectionRow>
       )}
+      <LaunchOptionControl appid={appid} needed={installed === "ngx"} />
       {o.configured && (
         <>
+          {installed === "ngx" && o.opti_log.not_nvidia && (
+            <Note>
+              <span style={{ color: "#d94126" }}>
+                OptiScaler.log says "Not running on Nvidia, disabling DLSS": the launch option wasn't active when the
+                game last started. Check it above, then restart the game.
+              </span>
+            </Note>
+          )}
           <CheckBlock check={o.check} ini={o.ini} />
           <Note>
-            In game, open the OptiScaler menu: Upscalers → FFX Upscaler should read "FSR HelixSR (3.1.5)". A red frame
-            around the picture means the network isn't built.
+            {installed === "ngx"
+              ? "In the game, select DLSS as the upscaler. OptiScaler's menu then shows DLSS; switch to FSR there to compare live. A red frame around the picture means the network isn't built."
+              : 'In game, open the OptiScaler menu: Upscalers → FFX Upscaler should read "FSR HelixSR (3.1.5)". A red frame around the picture means the network isn\'t built.'}
           </Note>
           <PanelSectionRow>
             <ToggleField
@@ -863,11 +1060,13 @@ function OptiItem({ o, active, reload }: { o: OptiTarget; active: Active; reload
           {o.opti_log.exists && (
             <PanelSectionRow>
               <div style={mono}>
-                {o.opti_log.lines.length > 0 ? o.opti_log.lines.join("\n") : "OptiScaler.log has no lines about HelixSR / FFX yet."}
+                {o.opti_log.lines.length > 0
+                  ? o.opti_log.lines.join("\n")
+                  : "OptiScaler.log has no lines about HelixSR / DLSS / FFX yet."}
               </div>
             </PanelSectionRow>
           )}
-          <IniControls folder={o.helix_folder} ini={o.ini} onChange={reload} />
+          <IniControls folder={o.helix_folder} ini={o.ini} kind={installed ?? "ffx"} onChange={reload} />
         </>
       )}
     </>
@@ -906,7 +1105,7 @@ function GameSection({ appid, active }: { appid: string; active: Active }) {
       {game.optiscaler.length > 0 && (
         <PanelSection title="OptiScaler">
           {game.optiscaler.map((o) => (
-            <OptiItem key={o.dir} o={o} active={active} reload={reload} />
+            <OptiItem key={o.dir} o={o} active={active} appid={game.appid} reload={reload} />
           ))}
         </PanelSection>
       )}
@@ -1010,7 +1209,12 @@ function Content() {
         <GameSection
           key={current.appid}
           appid={current.appid}
-          active={{ ready: !!helix?.built, tag: helix?.active ?? null, version: helix?.version ?? null }}
+          active={{
+            ready: !!helix?.built,
+            tag: helix?.active ?? null,
+            version: helix?.version ?? null,
+            kind: helix?.kind ?? null,
+          }}
         />
       )}
     </>

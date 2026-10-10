@@ -43,7 +43,13 @@ SEPARATE_FILES = ("helixsr_weights.bin", "helixsr_kernels.pak")   # the network 
 
 NAMES = ("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_dx12.dll")
 INSTALL_MARKER = "helixsr-install.json"        # the official installer's marker, kept compatible
-OPTI_MARKER = "helixsr-decky-optiscaler.json"  # ours, inside the HelixSR folder made for OptiScaler
+OPTI_MARKER = "helixsr-decky-optiscaler.json"  # ours, inside the HelixSR folder made for OptiScaler (FSR-based)
+# HelixSR 1.5+ is an NGX core (nvngx.dll) that OptiScaler's DLSS backend loads; it is installed exactly like the
+# official helixsr-install.sh does it (same folder, marker and backup), so either tool can undo the other's install
+DLL_FFX = "amd_fidelityfx_dx12.dll"   # HelixSR up to 1.4: an FSR 3.1 replacement
+DLL_NGX = "nvngx.dll"                 # HelixSR 1.5+: a DLSS (NGX) replacement, OptiScaler only
+NGX_MARKER = "helixsr-install.json"   # in the HelixSR folder next to OptiScaler.ini: {"helixsr", "previous"}
+NGX_LAUNCH_VARS = "PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100"
 OPTI_SUBDIR = "HelixSR"
 FSR4_COPY_NAME = "amd_fidelityfx_upscaler_dx12.amd.dll"
 EMBED_MAGIC = b"HXSRNET1"
@@ -92,8 +98,21 @@ def version_dir(tag):
     return base_dir() if tag == LEGACY_TAG else base_dir() / tag
 
 
+def release_dll(d):
+    """The HelixSR DLL in a release folder: nvngx.dll (1.5+) or amd_fidelityfx_dx12.dll (up to 1.4), or None."""
+    for name in (DLL_NGX, DLL_FFX):
+        p = Path(d) / name
+        if p.exists() and is_helixsr(p):
+            return p
+    return None
+
+
+def dll_kind(dll):
+    return "ngx" if Path(dll).name.lower() == DLL_NGX else "ffx"
+
+
 def local_versions():
-    """Downloaded releases: [{tag, dir, version, built, setup_script}], newest first."""
+    """Downloaded releases: [{tag, dir, version, kind, built, setup_script}], newest first."""
     out = []
     candidates = [(LEGACY_TAG, base_dir())]
     try:
@@ -101,10 +120,10 @@ def local_versions():
     except OSError:
         pass
     for tag, d in candidates:
-        dll = d / "amd_fidelityfx_dx12.dll"
-        if dll.exists() and is_helixsr(dll):
-            out.append({"tag": tag, "dir": str(d), "version": helix_version(dll), "built": has_network(dll),
-                        "setup_script": (d / "helixsr-setup.sh").exists()})
+        dll = release_dll(d)
+        if dll:
+            out.append({"tag": tag, "dir": str(d), "version": helix_version(dll), "kind": dll_kind(dll),
+                        "built": has_network(dll), "setup_script": (d / "helixsr-setup.sh").exists()})
     out.sort(key=lambda v: version_key(v["version"] or v["tag"]), reverse=True)
     return out
 
@@ -370,13 +389,14 @@ def helix_state():
     return {"base": str(base_dir()), "active": tag, "versions": local,
             "dir": cur["dir"] if cur else (str(version_dir(tag)) if tag else None),
             "downloaded": cur is not None, "version": cur["version"] if cur else None,
-            "built": bool(cur and cur["built"]), "setup_script": bool(cur and cur["setup_script"])}
+            "built": bool(cur and cur["built"]), "setup_script": bool(cur and cur["setup_script"]),
+            "kind": cur["kind"] if cur else None}
 
 
 def built_dll():
     d = active_dir()
-    dll = d / "amd_fidelityfx_dx12.dll"
-    if not dll.exists() or not is_helixsr(dll):
+    dll = release_dll(d)
+    if not dll:
         raise RuntimeError(f"HelixSR {active_tag()} isn't downloaded yet ({d}).")
     if not has_network(dll):
         raise RuntimeError(f"HelixSR {active_tag()} has no network yet. Run its setup first "
@@ -540,10 +560,13 @@ def opti_log_check(opti_dir):
     log = linux_path(name, opti_dir) or (opti_dir / name)
     info = file_info(log)
     if not info:
-        return {"exists": False, "path": str(log), "lines": []}
-    lines = [l.strip() for l in tail_lines(log, 4000)
-             if re.search(r"helixsr|amd_fidelityfx|ffx.*upscaler|upscaler.*ffx", l, re.I)]
-    return {"exists": True, "path": str(log), "mtime": info["mtime"], "lines": lines[-15:]}
+        return {"exists": False, "path": str(log), "lines": [], "not_nvidia": False}
+    all_lines = tail_lines(log, 4000)
+    lines = [l.strip() for l in all_lines
+             if re.search(r"helixsr|amd_fidelityfx|ffx.*upscaler|upscaler.*ffx|nvngx|dlss|not running on nvidia", l, re.I)]
+    # HelixSR 1.5+ needs the GPU to look like an NVIDIA one; OptiScaler says this when the launch option is missing
+    not_nvidia = any("not running on nvidia" in l.lower() for l in all_lines)
+    return {"exists": True, "path": str(log), "mtime": info["mtime"], "lines": lines[-15:], "not_nvidia": not_nvidia}
 
 
 def helix_ini_values(folder):
@@ -582,6 +605,21 @@ def resolve_ffx(opti_dir, text, key, filename):
     return None
 
 
+def ngx_marker_data(opti_dir):
+    """The marker of an NGX install (by this plugin or by the official helixsr-install 1.5+), or None."""
+    data = read_json(Path(opti_dir) / OPTI_SUBDIR / NGX_MARKER)
+    return data if isinstance(data, dict) and isinstance(data.get("previous"), dict) else None
+
+
+def installed_kind(opti_dir):
+    sub = Path(opti_dir) / OPTI_SUBDIR
+    if (sub / OPTI_MARKER).exists():
+        return "ffx"
+    if ngx_marker_data(opti_dir) is not None:
+        return "ngx"
+    return None
+
+
 def opti_state(opti_dir, game_folder):
     ini = opti_dir / "OptiScaler.ini"
     text = read_text(ini)
@@ -596,12 +634,24 @@ def opti_state(opti_dir, game_folder):
     if current_sr and is_helixsr(current_sr):
         current_sr = None
     helix_files = sub / NAMES[1]
+    kind = installed_kind(opti_dir)
+    nvngx = ini_get(text, "Libraries", "NvngxPath") or "auto"
+    if kind == "ngx":
+        nv_path = linux_path(nvngx, opti_dir)
+        configured = nv_path is not None and os.path.realpath(nv_path) == os.path.realpath(sub / DLL_NGX) and \
+            (ini_get(text, "Upscalers", "Dx12Upscaler") or "").strip().lower() == "dlss"
+        helix_files = sub / DLL_NGX
+        current_sr = resolve_ffx(opti_dir, text, "FfxDx12SRPath", NAMES[0])
+        if current_sr and is_helixsr(current_sr):
+            current_sr = None
     return {
         "dir": str(opti_dir),
         "rel": os.path.relpath(opti_dir, game_folder),
         "configured": configured,
-        "helix_folder_present": marker.exists(),
+        "installed_kind": kind,
+        "helix_folder_present": kind is not None,
         "helix_version": helix_version(helix_files) if helix_files.exists() else None,
+        "nvngx_path": nvngx,
         "dx12_upscaler": ini_get(text, "Upscalers", "Dx12Upscaler") or "auto",
         "upscaler_index": ini_get(text, "FSR", "UpscalerIndex") or "auto",
         "ffx_path": ffx,
@@ -659,6 +709,10 @@ def uninstall_direct(target, ini_src):
 
 
 def install_optiscaler(opti_dir, dll, ini_src, keep_fsr4):
+    if dll_kind(dll) == "ngx":
+        return install_optiscaler_ngx(opti_dir, dll)
+    if installed_kind(opti_dir) == "ngx":
+        uninstall_optiscaler_ngx(opti_dir)   # switching back from 1.5+ to an FSR-based release
     ini = opti_dir / "OptiScaler.ini"
     text = read_text(ini)
     sub = opti_dir / OPTI_SUBDIR
@@ -710,10 +764,62 @@ def install_optiscaler(opti_dir, dll, ini_src, keep_fsr4):
     return "OptiScaler now uses HelixSR" + (" (FSR 4 stays selectable)" if (sub / FSR4_COPY_NAME).exists() else "")
 
 
+def install_optiscaler_ngx(opti_dir, dll):
+    """HelixSR 1.5+, as helixsr-install.sh does it: nvngx.dll in a HelixSR folder next to OptiScaler.ini,
+    Dx12Upscaler = dlss and NvngxPath = that DLL. Previous values in the marker, the original file as a backup."""
+    ini = opti_dir / "OptiScaler.ini"
+    sub = opti_dir / OPTI_SUBDIR
+    if installed_kind(opti_dir) == "ffx":
+        uninstall_optiscaler(opti_dir)   # an FSR-based HelixSR (1.4 and older) set up here before
+    if sub.exists() and installed_kind(opti_dir) is None and any(sub.iterdir()):
+        raise RuntimeError(f"{sub} exists but wasn't made by HelixSR's installer or this plugin; rename or remove it "
+                           f"first.")
+    text = read_text(ini)
+    data = ngx_marker_data(opti_dir)
+    prev = data["previous"] if data else {
+        "Dx12Upscaler": ini_get(text, "Upscalers", "Dx12Upscaler") or "auto",
+        "NvngxPath": ini_get(text, "Libraries", "NvngxPath") or "auto"}
+    backup = opti_dir / "OptiScaler.ini.helixsr-backup"
+    if not backup.exists():
+        shutil.copyfile(ini, backup)
+    sub.mkdir(exist_ok=True)
+    copy_helix(dll, sub / DLL_NGX)
+    text = ini_set(text, "Upscalers", "Dx12Upscaler", "dlss")
+    text = ini_set(text, "Libraries", "NvngxPath", win_path(sub / DLL_NGX))
+    write_text(ini, text)
+    (sub / NGX_MARKER).write_text(json.dumps({"helixsr": helix_version(dll) or "?", "previous": prev}, indent=1) + "\n")
+    return f"OptiScaler now uses HelixSR {helix_version(dll)} as DLSS. Add the launch option, then pick DLSS in the game."
+
+
+def uninstall_optiscaler_ngx(opti_dir):
+    ini = opti_dir / "OptiScaler.ini"
+    sub = opti_dir / OPTI_SUBDIR
+    data = ngx_marker_data(opti_dir)
+    if data is None:
+        raise RuntimeError("No HelixSR 1.5+ install here.")
+    if ini.exists():
+        text = read_text(ini)
+        for (section, key) in (("Upscalers", "Dx12Upscaler"), ("Libraries", "NvngxPath")):
+            text = ini_set(text, section, key, data["previous"].get(key) or "auto")
+        write_text(ini, text)
+        backup = opti_dir / "OptiScaler.ini.helixsr-backup"
+        if backup.exists() and backup.read_bytes() == ini.read_bytes():
+            backup.unlink()   # nothing else changed: the backup is no longer needed
+    for n in (DLL_NGX, NGX_MARKER, "helixsr.log", "helixsr.ini", *SEPARATE_FILES):
+        (sub / n).unlink(missing_ok=True)
+    try:
+        sub.rmdir()
+    except OSError:
+        pass
+    return "OptiScaler is back to its previous upscaler. Remove the launch option if you added it."
+
+
 def uninstall_optiscaler(opti_dir):
     ini = opti_dir / "OptiScaler.ini"
     sub = opti_dir / OPTI_SUBDIR
     marker = sub / OPTI_MARKER
+    if installed_kind(opti_dir) == "ngx":
+        return uninstall_optiscaler_ngx(opti_dir)
     if not marker.exists():
         raise RuntimeError("HelixSR wasn't set up for OptiScaler here by this plugin.")
     data = json.loads(marker.read_text())
@@ -964,7 +1070,7 @@ def write_debug_report():
 # --- clean ------------------------------------------------------------------------------------------------------------
 
 # what a HelixSR release zip (1.2.0 - 1.4.1) and its setup put into a release folder
-RELEASE_FILES = {"amd_fidelityfx_dx12.dll", "helixsr.ini", "helixsr_weights.bin", "helixsr_kernels.pak",
+RELEASE_FILES = {"amd_fidelityfx_dx12.dll", "nvngx.dll", "helixsr.ini", "helixsr_weights.bin", "helixsr_kernels.pak",
                  "helixsr_setup.json", "LICENSE", "LICENSE-APACHE-2.0", "README.md", "SOURCE.md",
                  "THIRD_PARTY_NOTICES.md", "helixsr-setup.sh", "helixsr-setup.bat", "helixsr-setup.ps1",
                  "helixsr-install.sh", "helixsr-install.bat", "helixsr.log"}
@@ -986,7 +1092,7 @@ def tree_size(p):
 
 def is_release_folder(d):
     return (d / "helixsr-setup.sh").exists() or (d / "setup" / "helixsr_setup.py").exists() or \
-        ((d / "amd_fidelityfx_dx12.dll").exists() and is_helixsr(d / "amd_fidelityfx_dx12.dll"))
+        release_dll(d) is not None
 
 
 def clean_targets():
@@ -1206,7 +1312,7 @@ class Plugin:
                 dlls, opti = scan_folder(g["path"])
                 targets = direct_targets(dlls)
                 installed = any(is_helixsr(t) and original_of(t).exists() for t in targets) or \
-                    any((o / OPTI_SUBDIR / OPTI_MARKER).exists() for o in opti)
+                    any(installed_kind(o) is not None for o in opti)
                 out.append({**g, "fsr": bool(targets), "optiscaler": bool(opti), "helixsr": installed})
             out.sort(key=lambda x: x["name"].lower())
             return out
@@ -1273,8 +1379,13 @@ class Plugin:
             return {"ok": False, "error": str(e)}
 
     async def install_direct(self, path):
-        return await self._do(lambda: install_direct(self._checked_target(path), built_dll(),
-                                                     active_dir() / "helixsr.ini"))
+        def work():
+            dll = built_dll()
+            if dll_kind(dll) == "ngx":
+                raise RuntimeError(f"HelixSR {helix_version(dll)} only works through OptiScaler (as DLSS). Pick a 1.4 "
+                                   f"release to replace a game's FSR 3.1 directly.")
+            return install_direct(self._checked_target(path), dll, active_dir() / "helixsr.ini")
+        return await self._do(work)
 
     async def uninstall_direct(self, path):
         return await self._do(lambda: uninstall_direct(self._checked_target(path), active_dir() / "helixsr.ini"))
@@ -1297,7 +1408,7 @@ class Plugin:
     async def set_helix_option(self, folder, option, value):
         def work():
             f = Path(folder)
-            if not inside_library(f / "helixsr.ini") or not any(is_helixsr(f / n) for n in NAMES):
+            if not inside_library(f / "helixsr.ini") or not any(is_helixsr(f / n) for n in (*NAMES, DLL_NGX)):
                 raise RuntimeError("No HelixSR install in that folder.")
             ini = f / "helixsr.ini"
             if not ini.exists():
