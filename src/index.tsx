@@ -109,7 +109,7 @@ type OptiTarget = {
   dir: string;
   rel: string;
   configured: boolean;
-  installed_kind: ReleaseKind | null;
+  installed_kind: ReleaseKind | "official" | null; // "official": set up by HelixSR 1.7+'s own setup
   nvngx_path: string;
   helix_folder_present: boolean;
   helix_version: string | null;
@@ -128,11 +128,22 @@ type OptiTarget = {
 
 type Active = { ready: boolean; tag: string | null; version: string | null; kind: ReleaseKind | null };
 
-// 1.5.0 is where HelixSR became an NGX core; before a release is downloaded, its tag is all there is to go by
+function versionAtLeast(v: string | null | undefined, major: number, minor: number) {
+  const m = (v ?? "").match(/(\d+)\.(\d+)/);
+  return !!m && (Number(m[1]) > major || (Number(m[1]) === major && Number(m[2]) >= minor));
+}
+
+// Only 1.5.x and 1.6.x were the DLSS (NGX) route; 1.7 went back to replacing FSR 3.1. Before a release is downloaded,
+// its tag is all there is to go by.
 function isNgxRelease(tag: string | null, local?: LocalVersion) {
   if (local) return local.kind === "ngx";
-  const m = (tag ?? "").match(/(\d+)\.(\d+)/);
-  return !!m && (Number(m[1]) > 1 || (Number(m[1]) === 1 && Number(m[2]) >= 5));
+  return versionAtLeast(tag, 1, 5) && !versionAtLeast(tag, 1, 7);
+}
+
+// 1.5+ have no settings file (1.7 ignores sharpening "whatever an old helixsr.ini says"); only the network test switch
+// is offered there, as an experiment, since their DLLs still contain it
+function hasSettingsFile(kind: string | null, version: string | null | undefined) {
+  return kind !== "ngx" && kind !== "official" && !versionAtLeast(version, 1, 5);
 }
 
 type GameSummary = { appid: string; name: string; path: string; fsr: boolean; optiscaler: boolean; helixsr: boolean };
@@ -591,6 +602,13 @@ function HelixSection({ state, refresh }: { state: HelixState | null; refresh: (
           </div>
         )}
         {rel?.published_at && <div>Published {new Date(rel.published_at).toLocaleDateString()}</div>}
+        {tag && versionAtLeast(local.get(tag)?.version ?? tag, 1, 7) && (
+          <div>
+            1.7 replaces FSR 3.1 again: through OptiScaler for DLSS games (select DLSS in the game), or in place of a
+            game's own FSR 3.1. No launch option, no settings. Run in Desktop Mode, HelixSR's own setup would also put its
+            own OptiScaler into your games; the plugin only builds the network and uses the OptiScaler you already have.
+          </div>
+        )}
         {tag && isNgxRelease(tag, local.get(tag)) && (
           <div>
             Since 1.5, HelixSR runs as DLSS and only through OptiScaler (0.9.4). It needs a Steam launch option, which
@@ -701,12 +719,12 @@ function CheckBlock({ check, ini }: { check: Check; ini: IniValues }) {
 function IniControls({
   folder,
   ini,
-  kind,
+  settingsFile,
   onChange,
 }: {
   folder: string;
   ini: IniValues;
-  kind: ReleaseKind;
+  settingsFile: boolean;
   onChange: () => void;
 }) {
   const save = async (option: string, value: string) => {
@@ -719,15 +737,15 @@ function IniControls({
         <ToggleField
           label="DLSS network (Model E)"
           description={
-            kind === "ngx"
-              ? "Experimental for 1.5+: HelixSR 1.5 documents no settings but still contains this helixsr.ini switch. Turn off and restart the game; if the picture turns blurry, HelixSR is upscaling. If nothing changes, the switch may simply not apply in 1.5."
+            !settingsFile
+              ? "Experimental for 1.5+: this release documents no settings but its DLL still contains this helixsr.ini switch. Turn off and restart the game; if the picture turns blurry, HelixSR is upscaling. If nothing changes, the switch may simply not apply."
               : "Turn off to prove HelixSR is upscaling: it then falls back to a simple, blurry upscale. Takes effect after restarting the game; for live comparisons switch upscalers in OptiScaler's menu."
           }
           checked={ini.model_e_enabled}
           onChange={(on) => save("model_e", on ? "true" : "false")}
         />
       </PanelSectionRow>
-      {kind === "ffx" && (
+      {settingsFile && (
         <>
       {ini.network_resolutions.length > 0 && (
         <PanelSectionRow>
@@ -822,7 +840,12 @@ function DirectSection({ items, active, reload }: { items: DirectTarget[]; activ
             {installed && (
               <>
                 <CheckBlock check={t.check} ini={t.ini} />
-                <IniControls folder={t.path.replace(/\/[^/]+$/, "")} ini={t.ini} kind="ffx" onChange={reload} />
+                <IniControls
+                  folder={t.path.replace(/\/[^/]+$/, "")}
+                  ini={t.ini}
+                  settingsFile={hasSettingsFile("ffx", t.helix_version)}
+                  onChange={reload}
+                />
               </>
             )}
           </div>
@@ -965,6 +988,7 @@ function OptiItem({
 
   const ngxActive = active.kind === "ngx";
   const installed = o.installed_kind;
+  const official = installed === "official";
   const differs = installed !== null && !!active.version && o.helix_version !== active.version;
   const sizeMb = o.current_sr_dll ? (o.current_sr_dll.size / 1048576).toFixed(1) : null;
 
@@ -973,7 +997,9 @@ function OptiItem({
       <Note>
         <div style={{ fontWeight: 600 }}>{o.rel === "." ? "Game folder" : o.rel}</div>
         <div>
-          {o.configured
+          {official
+            ? `HelixSR ${o.helix_version ?? ""} installed by HelixSR's own setup, together with its own OptiScaler`
+            : o.configured
             ? installed === "ngx"
               ? `Uses HelixSR ${o.helix_version ?? ""} as DLSS`
               : `Uses HelixSR ${o.helix_version ?? ""}${o.kept_fsr4 ? " (FSR 4 selectable next to it)" : ""}`
@@ -1003,7 +1029,12 @@ function OptiItem({
           />
         </PanelSectionRow>
       )}
-      {!o.configured ? (
+      {official ? (
+        <Note>
+          The plugin leaves this install to HelixSR's setup. To update or remove it, run helixsr-setup.sh from HelixSR's
+          folder in Desktop Mode (answer r for this game to remove). The check below still works.
+        </Note>
+      ) : !o.configured ? (
         <PanelSectionRow>
           <ButtonItem
             layout="below"
@@ -1028,7 +1059,7 @@ function OptiItem({
           </PanelSectionRow>
         )
       )}
-      {installed && (
+      {installed && !official && (
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={busy} onClick={() => run(() => uninstallOptiscaler(o.dir))}>
             Revert OptiScaler to previous upscaler
@@ -1050,7 +1081,7 @@ function OptiItem({
           <Note>
             {installed === "ngx"
               ? "In the game, select DLSS as the upscaler. OptiScaler's menu then shows DLSS; switch to FSR there to compare live. A red frame around the picture means the network isn't built."
-              : 'In game, open the OptiScaler menu: Upscalers → FFX Upscaler should read "FSR HelixSR (3.1.5)". A red frame around the picture means the network isn\'t built.'}
+              : 'In game, select DLSS (or FSR in games without DLSS), then open the OptiScaler menu: Upscalers → FFX Upscaler should read "FSR HelixSR (3.1.5)". A red frame around the picture means the network isn\'t built.'}
           </Note>
           <PanelSectionRow>
             <ToggleField
@@ -1070,7 +1101,12 @@ function OptiItem({
               </div>
             </PanelSectionRow>
           )}
-          <IniControls folder={o.helix_folder} ini={o.ini} kind={installed ?? "ffx"} onChange={reload} />
+          <IniControls
+            folder={o.helix_folder}
+            ini={o.ini}
+            settingsFile={hasSettingsFile(installed, o.helix_version)}
+            onChange={reload}
+          />
         </>
       )}
     </>

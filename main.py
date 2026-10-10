@@ -631,12 +631,21 @@ def ngx_marker_data(opti_dir):
     return data if isinstance(data, dict) and isinstance(data.get("previous"), dict) else None
 
 
+def official_marker_data(opti_dir):
+    """An install by HelixSR 1.7+'s own setup (its OptiScaler, fakenvapi, helixsr.dll / helixsr_upscaler.dll), or None.
+    The plugin shows it but leaves managing it to that setup, which also put its own OptiScaler into the game."""
+    data = read_json(Path(opti_dir) / OPTI_SUBDIR / NGX_MARKER)
+    return data if isinstance(data, dict) and data.get("route") == "optiscaler" and "previous" not in data else None
+
+
 def installed_kind(opti_dir):
     sub = Path(opti_dir) / OPTI_SUBDIR
     if (sub / OPTI_MARKER).exists():
         return "ffx"
     if ngx_marker_data(opti_dir) is not None:
         return "ngx"
+    if official_marker_data(opti_dir) is not None:
+        return "official"
     return None
 
 
@@ -656,6 +665,9 @@ def opti_state(opti_dir, game_folder):
     helix_files = sub / NAMES[1]
     kind = installed_kind(opti_dir)
     nvngx = ini_get(text, "Libraries", "NvngxPath") or "auto"
+    if kind == "official":
+        configured = True
+        helix_files = sub / "helixsr.dll"
     if kind == "ngx":
         nv_path = linux_path(nvngx, opti_dir)
         configured = nv_path is not None and os.path.realpath(nv_path) == os.path.realpath(sub / DLL_NGX) and \
@@ -731,6 +743,7 @@ def uninstall_direct(target, ini_src):
 def install_optiscaler(opti_dir, dll, ini_src, keep_fsr4):
     if dll_kind(dll) == "ngx":
         return install_optiscaler_ngx(opti_dir, dll)
+    refuse_official(opti_dir)
     if installed_kind(opti_dir) == "ngx":
         uninstall_optiscaler_ngx(opti_dir)   # switching back from 1.5+ to an FSR-based release
     ini = opti_dir / "OptiScaler.ini"
@@ -784,9 +797,18 @@ def install_optiscaler(opti_dir, dll, ini_src, keep_fsr4):
     return "OptiScaler now uses HelixSR" + (" (FSR 4 stays selectable)" if (sub / FSR4_COPY_NAME).exists() else "")
 
 
+def refuse_official(opti_dir):
+    data = official_marker_data(opti_dir)
+    if data is not None:
+        raise RuntimeError(f"HelixSR {data.get('helixsr', '')} was installed here by HelixSR's own setup, together with "
+                           f"its own OptiScaler. Remove it with that setup first (run helixsr-setup.sh in Desktop Mode "
+                           f"and answer r for this game).")
+
+
 def install_optiscaler_ngx(opti_dir, dll):
     """HelixSR 1.5+, as helixsr-install.sh does it: nvngx.dll in a HelixSR folder next to OptiScaler.ini,
     Dx12Upscaler = dlss and NvngxPath = that DLL. Previous values in the marker, the original file as a backup."""
+    refuse_official(opti_dir)
     ini = opti_dir / "OptiScaler.ini"
     sub = opti_dir / OPTI_SUBDIR
     if installed_kind(opti_dir) == "ffx":
@@ -840,6 +862,7 @@ def uninstall_optiscaler(opti_dir):
     marker = sub / OPTI_MARKER
     if installed_kind(opti_dir) == "ngx":
         return uninstall_optiscaler_ngx(opti_dir)
+    refuse_official(opti_dir)
     if not marker.exists():
         raise RuntimeError("HelixSR wasn't set up for OptiScaler here by this plugin.")
     data = json.loads(marker.read_text())
@@ -871,8 +894,14 @@ PHASES = [  # (log pattern, progress %, label)
     (r"3/5 fragment tables", 18, "Step 3/5: fragment tables"),
     (r"4/5 kernel sources", 40, "Step 4/5: generating shader sources"),
     (r"5/5 shaders", 50, "Step 5/5: compiling shaders"),
-    (r"HelixSR is ready|now carries the network", 100, "Finished"),
+    (r"building the network", 10, "Building the network"),   # 1.7+: one step, with its own progress lines
+    (r"HelixSR is ready|now carries the network|done: the network is built", 100, "Finished"),
+    # 1.7+: after the build the setup moves on to its game installer, which the plugin leaves unanswered on purpose
+    (r"looking for games with DLSS", 100, "Finished (install into games per game, below)"),
 ]
+# 1.7+: "[helixsr-setup] [########------------]  42%  1:23  shaders 12/72"
+BUILD_PROGRESS = re.compile(r"\[[#-]{5,}\]\s+(\d+)%\s+\d+:\d\d\s+(.*?)\s*$")
+PROMPT_LINE = re.compile(r"\[Y/n")   # the setup's own game installer asking; never answered by the plugin
 ERROR_PATTERN = re.compile(r"error|failed|traceback|no such file|not found|denied|mismatch|cannot|killed", re.I)
 
 
@@ -929,6 +958,10 @@ def phase_of(lines):
         for pat, p, l in PHASES:
             if re.search(pat, line) and p >= pct:
                 pct, label = p, l
+        m = BUILD_PROGRESS.search(line)
+        if m and pct < 100:
+            bar = int(m.group(1))
+            pct, label = 10 + int(bar * 0.89), f"Building the network: {m.group(2)} ({bar}%)"
     return pct, label
 
 
@@ -951,6 +984,21 @@ def read_json(p):
         return json.loads(Path(p).read_text())
     except (OSError, ValueError):
         return None
+
+
+def setup_command(script, d, built):
+    """Arguments for a release's helixsr-setup.sh. Up to 1.6 the script takes the HelixSR folder and only builds.
+    From 1.7 it builds and then runs its own game installer, extra arguments are *game* folders, and a built network is
+    only rebuilt with --rebuild. Its installer is never answered (stdin is closed, so it stops at its first question):
+    the plugin installs per game itself. A script that would pass --yes on to its installer is refused, since --yes
+    could then mean "install into every game"."""
+    text = Path(script).read_text(errors="replace")
+    if "--rebuild" not in text:
+        return ["bash", str(script), str(d), "--yes"]
+    if re.search(r"helixsr_install\.py[^\n]*(PASS|--yes)", text):
+        raise RuntimeError("This release's setup would answer its own game installer automatically. Run it from "
+                           "Desktop Mode instead (Konsole: " + str(script) + "), then install per game here.")
+    return ["bash", str(script), "--yes"] + (["--rebuild"] if built else [])
 
 
 def setup_status():
@@ -1002,7 +1050,7 @@ def setup_status():
         "processes": [short_cmd(table[p][2], table[p][1]) for p in tree if p in table
                       and not re.match(r"(bash|sh|wineserver|tee)\b", table[p][1])][:4],
         "errors": [l.strip() for l in lines if ERROR_PATTERN.search(l)][-6:],
-        "tail": [l for l in lines if l.strip()][-8:],
+        "tail": [l for l in lines if l.strip() and not PROMPT_LINE.search(l)][-8:],
         "log_path": str(SETUP_LOG),
     }
 
@@ -1256,13 +1304,18 @@ class Plugin:
             SETUP_RC.unlink()
         env = clean_env()
         env["TMPDIR"] = str(SETUP_TMP)
+        dll = release_dll(d)
+        try:
+            cmd = setup_command(script, d, bool(dll and has_network(dll)))
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
         with open(SETUP_LOG, "wb") as log:
-            log.write(f"[decky] {time.ctime()}: running {script} {d} --yes\n".encode())
+            log.write(f"[decky] {time.ctime()}: running {' '.join(cmd[1:])}\n".encode())
             log.flush()
             # A wrapper shell records the exit code in a file, so the result is known even if Decky restarts the
             # plugin meanwhile. --yes: the user agreed to NVIDIA's DLSS download in the confirmation dialog.
             proc = subprocess.Popen(
-                ["bash", "-c", 'bash "$0" "$1" --yes; echo $? > "$2"', str(script), str(d), str(SETUP_RC)],
+                ["bash", "-c", '"$@"; echo $? > "$0"', str(SETUP_RC), *cmd],
                 cwd=str(d), env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True)
         SETUP_STATUS.write_text(json.dumps({"tag": tag, "pid": proc.pid, "started": time.time()}))
@@ -1428,7 +1481,8 @@ class Plugin:
     async def set_helix_option(self, folder, option, value):
         def work():
             f = Path(folder)
-            if not inside_library(f / "helixsr.ini") or not any(is_helixsr(f / n) for n in (*NAMES, DLL_NGX)):
+            if not inside_library(f / "helixsr.ini") or \
+                    not any(is_helixsr(f / n) for n in (*NAMES, DLL_NGX, "helixsr.dll")):
                 raise RuntimeError("No HelixSR install in that folder.")
             ini = f / "helixsr.ini"
             if not ini.exists():
@@ -1446,6 +1500,13 @@ class Plugin:
                 text = ini_set(text, "ModelE", "Enabled", value)
             else:
                 raise RuntimeError("Unknown option.")
+            # a file the plugin created only for the network switch goes away again when it's back on, so no stray
+            # helixsr.ini is left in a release without a settings file (or in an install made by HelixSR's setup)
+            meaningful = [re.sub(r"\s+", "", l) for l in text.splitlines()
+                          if l.strip() and not l.strip().startswith((";", "#"))]
+            if meaningful in ([], ["[ModelE]", "Enabled=true"]):
+                ini.unlink(missing_ok=True)
+                return "Saved (back to HelixSR's default). Restart the game to apply."
             write_text(ini, text)
             return "Saved. Restart the game to apply."
         return await self._do(work)
