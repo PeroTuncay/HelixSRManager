@@ -91,6 +91,7 @@ type IniValues = {
   sharpening: string;
   upscaler_dll: string;
   model_e_enabled: boolean;
+  network_resolutions: string[]; // what this install's own helixsr.ini documents (differs between releases)
 };
 
 type DirectTarget = {
@@ -165,11 +166,6 @@ const uninstallOptiscaler = callable<[path: string], Result>("uninstall_optiscal
 const setOptiLogging = callable<[path: string, on: boolean], Result>("set_opti_logging");
 const setHelixOption = callable<[folder: string, option: string, value: string], Result>("set_helix_option");
 
-const NETWORK_RESOLUTIONS = [
-  "auto", "full",
-  "QSSM Min", "QSSM Eco", "QSSM Light", "QSSM Balanced", "QSSM High", "QSSM Ultra",
-  "PRSM Light", "PRSM Quality", "PRSM Balanced", "PRSM Performance", "PRSM Ultra", "PRSM Extreme",
-];
 const SHARPENING = ["off", "game", "override"];
 
 // --- small UI helpers --------------------------------------------------------------------------------------------------
@@ -733,15 +729,23 @@ function IniControls({
       </PanelSectionRow>
       {kind === "ffx" && (
         <>
-      <PanelSectionRow>
-        <DropdownItem
-          label="Network resolution"
-          description="QSSM: sharper, slower. PRSM: faster, softer."
-          rgOptions={NETWORK_RESOLUTIONS.map((v) => ({ data: v, label: v }))}
-          selectedOption={ini.network_resolution}
-          onChange={(o) => save("network_resolution", o.data)}
-        />
-      </PanelSectionRow>
+      {ini.network_resolutions.length > 0 && (
+        <PanelSectionRow>
+          <DropdownItem
+            label="Network resolution"
+            description={
+              ini.network_resolutions.some((v) => v.startsWith("QSSM"))
+                ? "QSSM: sharper, slower. PRSM: faster, softer."
+                : ini.network_resolutions.includes("fast")
+                  ? "fast: faster, a little softer (also in Performance mode). full: always the full output size."
+                  : undefined
+            }
+            rgOptions={ini.network_resolutions.map((v) => ({ data: v, label: v }))}
+            selectedOption={ini.network_resolution}
+            onChange={(o) => save("network_resolution", o.data)}
+          />
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <DropdownItem
           label="Sharpening"

@@ -569,18 +569,38 @@ def opti_log_check(opti_dir):
     return {"exists": True, "path": str(log), "mtime": info["mtime"], "lines": lines[-15:], "not_nvidia": not_nvidia}
 
 
+def network_resolution_options(text):
+    """The NetworkResolution values the installed release documents in its own helixsr.ini ([Upscaling]): the option
+    list in its comments (";   auto  ...", ";   fast  ...") plus commented-out presets (";NetworkResolution = QSSM Min").
+    1.3/1.4.3: auto, fast, full; 1.4.0-1.4.2: auto, full, QSSM/PRSM; 1.2: none (no such setting)."""
+    out, cur = [], None
+    for line in text.splitlines():
+        m = re.match(r"^\s*\[(.+?)\]\s*$", line)
+        if m:
+            cur = m.group(1).strip().lower()
+            continue
+        if cur != "upscaling":
+            continue
+        for pat in (r"^;\s{2,}([a-z]+)\s{2,}\S", r"^;?\s*NetworkResolution\s*=\s*(.+?)\s*$"):
+            m = re.match(pat, line)
+            if m and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
 def helix_ini_values(folder):
     ini = Path(folder) / "helixsr.ini"
     if not ini.exists():
         return {"exists": False, "network_resolution": "auto", "sharpening": "off", "upscaler_dll": "",
-                "model_e_enabled": True}
+                "model_e_enabled": True, "network_resolutions": []}
     t = read_text(ini)
     return {"exists": True,
             "network_resolution": ini_get(t, "Upscaling", "NetworkResolution") or "auto",
             "sharpening": ini_get(t, "Sharpening", "Mode") or "off",
             "upscaler_dll": ini_get(t, "Forwarding", "UpscalerDll") or "",
             # HelixSR's default is on; anything but an explicit false counts as on
-            "model_e_enabled": (ini_get(t, "ModelE", "Enabled") or "true").strip().lower() != "false"}
+            "model_e_enabled": (ini_get(t, "ModelE", "Enabled") or "true").strip().lower() != "false",
+            "network_resolutions": network_resolution_options(t)}
 
 
 # --- OptiScaler -------------------------------------------------------------------------------------------------------
@@ -1418,7 +1438,7 @@ class Plugin:
                 else:
                     ini.write_text("")
             text = read_text(ini)
-            if option == "network_resolution" and value in NETWORK_RESOLUTIONS:
+            if option == "network_resolution" and value in (network_resolution_options(text) or NETWORK_RESOLUTIONS):
                 text = ini_set(text, "Upscaling", "NetworkResolution", value)
             elif option == "sharpening" and value in SHARPENING_MODES:
                 text = ini_set(text, "Sharpening", "Mode", value)

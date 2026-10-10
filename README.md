@@ -107,8 +107,10 @@ game's FSR**.
    HelixSR's are removed from the HelixSR folder.
 7. **Check**: reads `helixsr.log` (network running / not running / loaded but idle, wave size, network resolution) and,
    if enabled, OptiScaler.log lines about HelixSR/FFX.
-8. **Settings**: the DLSS network on/off test switch, `NetworkResolution` (auto/full/QSSM/PRSM) and sharpening per
-   install.
+8. **Settings**: the DLSS network on/off test switch, `NetworkResolution` and sharpening per install. The
+   `NetworkResolution` choices come from the installed release's own `helixsr.ini`, since they differ between
+   releases (1.4.3 is HelixSR 1.3.0 again: auto/fast/full; 1.4.0-1.4.2: auto/full/QSSM/PRSM). 1.5+ has no settings
+   file; only the experimental network switch is offered there.
 
 ## Build
 
